@@ -298,7 +298,7 @@ function usageMock(opts = {}) {
         return json(res, { credits: { planId: 'individual-goat', monthlyCredits: 12.5, purchasedCredits: 3, freeCredits: 0 } });
       }
       if (u.startsWith('/alpha/billing/subscriptions')) {
-        return json(res, { data: { planId: 'individual-goat', status: 'active', currentPeriodStart: '2026-10-01T00:00:00Z', currentPeriodEnd: '2026-11-01T00:00:00Z' } });
+        return json(res, { data: { planId: 'individual-goat', status: 'active', currentPeriodStart: new Date(Date.now() - 86400000).toISOString(), currentPeriodEnd: new Date(Date.now() + 86400000).toISOString() } });
       }
       if (u.startsWith('/alpha/usage/summary')) return json(res, { totalCost: 20 });
     },
@@ -363,7 +363,7 @@ function creditMock(opts = {}) {
     env: { CC_ADMIN_TOKEN: ADMIN_TOKEN },
     ...opts,
     onRequest(req, res) {
-      if (req.url !== '/alpha/generate') return; // 初始化预请求走默认 200
+      if (req.url !== '/alpha/generate') return creditUsageMock(opts).onRequest(req, res);
       const auth = String(req.headers.authorization || '');
       if (opts.rejectAll || auth.includes('poor_')) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -396,7 +396,9 @@ test('额度耗尽：同请求自动换号成功，耗尽账号进入长冷却',
     const mp = accountOf(m, poor.id), mr = accountOf(m, rich.id);
     assert.equal(mp.creditExhausted, true);
     assert.equal(mp.cooling, true);
-    assert.ok(mp.cooldownUntil - Date.now() > 60000, 'credit cooldown should be long (default 1h)');
+    assert.ok(mp.creditResetAt > Date.now());
+    assert.equal(mp.cooldownUntil, mp.creditResetAt);
+    assert.equal(whoamiHits(mock), 1, '明确错误也查询套餐时间');
     assert.equal(mr.creditExhausted, false);
   });
 });
@@ -416,6 +418,9 @@ test('额度耗尽：全部账号耗尽时透出上游 400，且账号都在长�
       assert.equal(accountOf(m, id).creditExhausted, true);
       assert.equal(accountOf(m, id).cooling, true);
     }
+    const blocked = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    assert.equal(blocked.status, 503, '全部耗尽不得 fail-open');
+    assert.ok((await blocked.text()).includes('no_available_account'));
   });
 });
 
@@ -455,13 +460,14 @@ test('额度耗尽：/v1/messages 同样自动换号', async () => {
 
 // 额度查询 mock：可切换「已充值」；穷号余额 0.10/套餐 10 → 已用 99%
 function creditUsageMock(opts = {}) {
-  const state = opts.state || { topUp: false };   // 由调用方持有，可在中途改（模拟充值）
+  const state = opts.state || { topUp: false };
+  if (!Object.hasOwn(state, 'resetAt')) state.resetAt = new Date(Date.now() + 86400000).toISOString();
   const json = (res, o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
   return {
     state,
     env: { CC_ADMIN_TOKEN: ADMIN_TOKEN },
     ...opts,
-    onRequest(req, res) {
+    async onRequest(req, res) {
       const u = req.url;
       const auth = String(req.headers.authorization || '');
       const poor = auth.includes('poor_');
@@ -471,13 +477,21 @@ function creditUsageMock(opts = {}) {
         res.end(JSON.stringify({ error: { code: 'INVALID_ARGUMENT', message: 'request rejected by upstream' } }));
         return;
       }
-      if (u.startsWith('/alpha/whoami')) return json(res, { org: { id: 'org_1', login: 'acme' }, user: { userName: 'u1' }, orgLimits: [] });
+      if (u.startsWith('/alpha/whoami')) {
+        if (opts.usageDelay) await sleep(opts.usageDelay);
+        if (state.failUsage) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'usage unavailable' } }));
+          return;
+        }
+        return json(res, { org: { id: 'org_1', login: 'acme' }, user: { userName: 'u1' }, orgLimits: [] });
+      }
       if (u.startsWith('/alpha/billing/credits')) {
         const remain = (state.topUp || !poor) ? 10 : 0.10;
         return json(res, { credits: { planId: 'individual-go', monthlyCredits: remain, purchasedCredits: 0, freeCredits: 0 } });
       }
       if (u.startsWith('/alpha/billing/subscriptions')) {
-        return json(res, { data: { planId: 'individual-go', status: 'active', currentPeriodStart: '2026-10-01T00:00:00Z', currentPeriodEnd: '2026-11-01T00:00:00Z' } });
+        return json(res, { data: { planId: 'individual-go', status: state.subscriptionStatus || 'active', currentPeriodStart: new Date(Date.now() - 86400000).toISOString(), currentPeriodEnd: state.resetAt } });
       }
       if (u.startsWith('/alpha/usage/summary')) return json(res, { totalCost: 0 });
     },
@@ -492,23 +506,21 @@ test('额度兜底：已用≥95% 且上游 400（文案不认识）时也换号
     await putRouting(proxy, { selection: 'best' });
     const cli = await addClient(proxy, { name: 'c' });
 
-    // 先播种额度缓存（穷号已用 99%）
-    const seeded = await admin(proxy, 'GET', '/admin/api/usage');
-    const pv = (await seeded.json()).usage.find(x => x.id === poor.id);
-    assert.ok(pv.credits.usagePercent >= 0.95, 'mock poor account should be >=95% used');
+    assert.equal(whoamiHits(mock), 0, 'no preloaded usage cache');
 
     const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
     assert.equal(r.status, 200, await r.text());
     assert.equal(countAuth(mock, 'user_poor_U'), 1);
     assert.equal(routeAuth(mock), 'Bearer user_rich_U', 'should fail over despite unknown error text');
+    assert.equal(whoamiHits(mock), 1, 'one fresh query for the failed attempt only');
     const mm = accountOf(await metrics(proxy), poor.id);
     assert.equal(mm.creditExhausted, true);
     assert.equal(mm.cooling, true);
   });
 });
 
-// ── 24. 充值后刷新额度 → 立即解除额度耗尽冷却 ────────────────
-test('额度兜底：额度查询确认已充值后立即解除冷却，无需等满 1 小时', async () => {
+// ── 24. 充值后刷新额度 / 重置指标不能提前解除阻断 ────────────
+test('额度兜底：充值查询及重置指标均不能提前解除额度阻断', async () => {
   const state = { topUp: false };
   await withSetup(creditUsageMock({ state }), async ({ proxy }) => {
     const poor = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_U', weight: 10 });
@@ -521,11 +533,205 @@ test('额度兜底：额度查询确认已充值后立即解除冷却，无需�
     assert.equal(r.status, 200);
     assert.equal(accountOf(await metrics(proxy), poor.id).cooling, true, 'should be cooling before top-up');
 
-    // 充值后强制刷新额度 → 冷却立即解除
+    // 充值后刷新不能解除套餐时间阻断
     state.topUp = true;
     await admin(proxy, 'GET', '/admin/api/usage?refresh=1');
     const after = accountOf(await metrics(proxy), poor.id);
-    assert.equal(after.creditExhausted, false, 'credit flag must be cleared');
-    assert.equal(after.cooling, false, 'cooldown must be lifted after top-up');
+    assert.equal(after.creditExhausted, true);
+    assert.equal(after.cooling, true);
+    assert.equal(after.creditResetAt, Date.parse(state.resetAt));
+    await admin(proxy, 'POST', '/admin/api/accounts/' + poor.id + '/reset-metrics');
+    const reset = accountOf(await metrics(proxy), poor.id);
+    assert.equal(reset.creditExhausted, true, '重置指标不能解除额度阻断');
+    assert.equal(reset.creditResetAt, after.creditResetAt);
+  });
+});
+
+for (const [path, body] of [
+  ['/v1/chat/completions', CHAT],
+  ['/v1/messages', { ...CHAT, max_tokens: 50 }],
+  ['/v1/responses', { model: 'm', input: 'hi' }],
+]) {
+  test('主动额度查询：creditFailoverMax=0 仍查询并长冷却 ' + path, async () => {
+    await withSetup(creditUsageMock(), async ({ proxy, mock }) => {
+      const poor = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_zero' });
+      await putRouting(proxy, { creditFailoverMax: 0 });
+      const cli = await addClient(proxy, { name: 'c' });
+      const r = await proxy.post(path, body, { Authorization: 'Bearer ' + cli.token });
+      assert.equal(r.status, 400);
+      assert.equal(countAuth(mock, 'user_poor_zero'), 1);
+      assert.equal(whoamiHits(mock), 1, 'handler must not query again');
+      const m = await metrics(proxy);
+      assert.equal(accountOf(m, poor.id).creditExhausted, true);
+      assert.equal(accountOf(m, poor.id).cooling, true);
+      assert.equal(m.inflight, 0);
+      assert.equal(accountOf(m, poor.id).totals.requests, 1);
+      assert.equal(accountOf(m, poor.id).creditResetAt, Date.parse((await (await admin(proxy, 'GET', '/admin/api/accounts/' + poor.id + '/usage')).json()).usage.subscription.currentPeriodEnd));
+      assert.ok(accountOf(m, poor.id).lastError.at <= Date.now());
+      assert.equal(accountOf(m, poor.id).lastError.status, 400);
+    });
+  });
+}
+
+for (const refreshState of ['failUsage', 'topUp']) {
+  test('主动额度查询：新结果推翻旧耗尽缓存 ' + refreshState, async () => {
+    const state = { topUp: false };
+    await withSetup(creditUsageMock({ state }), async ({ proxy, mock }) => {
+      const poor = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_stale', weight: 10 });
+      await addAccount(proxy, { name: 'rich', apiKey: 'user_rich_stale', weight: 1 });
+      await putRouting(proxy, { selection: 'best' });
+      const cli = await addClient(proxy, { name: 'c' });
+      const seeded = await admin(proxy, 'GET', '/admin/api/accounts/' + poor.id + '/usage');
+      assert.ok((await seeded.json()).usage.credits.usagePercent >= 0.95);
+      state[refreshState] = true;
+      const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+      assert.equal(r.status, 400);
+      assert.equal((await r.json()).error.message, 'request rejected by upstream');
+      assert.equal(whoamiHits(mock), 2, 'failure must refresh even with a cached result');
+      assert.equal(countAuth(mock, 'user_rich_stale'), 0);
+      const m = await metrics(proxy);
+      assert.equal(accountOf(m, poor.id).creditExhausted, false);
+      assert.equal(accountOf(m, poor.id).cooling, false);
+      assert.equal(m.inflight, 0);
+    });
+  });
+}
+
+test('主动额度查询：达到换号上限的最后失败账号也查询一次', async () => {
+  await withSetup(creditUsageMock(), async ({ proxy, mock }) => {
+    const a = await addAccount(proxy, { name: 'a', apiKey: 'user_poor_limit_A', weight: 10 });
+    const b = await addAccount(proxy, { name: 'b', apiKey: 'user_poor_limit_B', weight: 1 });
+    await putRouting(proxy, { selection: 'best', creditFailoverMax: 1 });
+    const cli = await addClient(proxy, { name: 'c' });
+    const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    assert.equal(r.status, 400);
+    assert.equal(whoamiHits(mock), 2);
+    const m = await metrics(proxy);
+    for (const id of [a.id, b.id]) {
+      assert.equal(accountOf(m, id).creditExhausted, true);
+      assert.equal(accountOf(m, id).cooling, true);
+      assert.equal(accountOf(m, id).totals.requests, 1);
+      assert.ok(Number.isFinite(accountOf(m, id).creditResetAt));
+      assert.equal(accountOf(m, id).cooldownUntil, accountOf(m, id).creditResetAt);
+      assert.ok(accountOf(m, id).lastError.at <= Date.now());
+    }
+    assert.equal(m.inflight, 0);
+  });
+});
+
+test('主动额度查询：同账号并发失败合并查询，完成后新失败重新查询', async () => {
+  await withSetup(creditUsageMock({ state: { topUp: true }, usageDelay: 300 }), async ({ proxy, mock }) => {
+    await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_concurrent' });
+    const cli = await addClient(proxy, { name: 'c' });
+    const auth = { Authorization: 'Bearer ' + cli.token };
+    const results = await Promise.all(Array.from({ length: 4 }, () => proxy.post('/v1/chat/completions', CHAT, auth)));
+    for (const r of results) assert.equal(r.status, 400);
+    assert.equal(whoamiHits(mock), 1);
+    const r = await proxy.post('/v1/chat/completions', CHAT, auth);
+    assert.equal(r.status, 400);
+    assert.equal(whoamiHits(mock), 2, 'in-flight entry must be removed after completion');
+    assert.equal((await metrics(proxy)).inflight, 0);
+  });
+});
+
+for (const [name, fields] of [
+  ['未知', { resetAt: null }],
+  ['无效', { resetAt: 'not-a-date' }],
+  ['过去', { resetAt: new Date(Date.now() - 86400000).toISOString() }],
+  ['inactive', { subscriptionStatus: 'inactive' }],
+  ['查询失败', { failUsage: true }],
+]) {
+  test('明确耗尽：' + name + '套餐时间保持硬阻断，后续可登记有效时间', async () => {
+    const state = { topUp: false, ...fields };
+    await withSetup(creditMock({ state }), async ({ proxy, mock }) => {
+      const a = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_unknown' });
+      await putRouting(proxy, { creditFailoverMax: 0 });
+      const cli = await addClient(proxy, { name: 'c' });
+      const auth = { Authorization: 'Bearer ' + cli.token };
+      assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 400);
+      const m = accountOf(await metrics(proxy), a.id);
+      assert.equal(m.creditResetAt, null);
+      assert.equal(m.creditResetUnknown, true);
+      assert.equal(m.creditBlocked, true);
+      assert.equal(m.cooling, true);
+      assert.equal(m.score, 0);
+      assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 503);
+      assert.equal(countAuth(mock, 'poor_'), 1);
+      state.failUsage = false;
+      state.topUp = true;
+      state.subscriptionStatus = 'active';
+      state.resetAt = new Date(Date.now() + 60000).toISOString();
+      await admin(proxy, 'GET', '/admin/api/accounts/' + a.id + '/usage?refresh=1');
+      const updated = accountOf(await metrics(proxy), a.id);
+      assert.equal(updated.creditResetAt, Date.parse(state.resetAt));
+      assert.equal(updated.cooldownUntil, updated.creditResetAt);
+      assert.equal(updated.creditBlocked, true);
+      assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 503);
+    });
+  });
+}
+
+test('套餐重置到期前阻断，到期后选路恢复尝试', async () => {
+  const state = { topUp: false };
+  const opts = creditUsageMock({ state });
+  const baseRequest = opts.onRequest;
+  opts.onRequest = (req, res) => {
+    if (req.url === '/alpha/generate' && state.topUp) return;
+    return baseRequest(req, res);
+  };
+  await withSetup(opts, async ({ proxy }) => {
+    const a = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_expiry' });
+    const cli = await addClient(proxy, { name: 'c' });
+    await putRouting(proxy, { creditFailoverMax: 0 });
+    const auth = { Authorization: 'Bearer ' + cli.token };
+    state.resetAt = new Date(Date.now() + 1500).toISOString();
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 400);
+    assert.equal(accountOf(await metrics(proxy), a.id).cooldownUntil, Date.parse(state.resetAt));
+    state.topUp = true;
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 503);
+    await sleep(Math.max(0, Date.parse(state.resetAt) - Date.now()) + 150);
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 200);
+    const m = accountOf(await metrics(proxy), a.id);
+    assert.equal(m.creditBlocked, false);
+    assert.equal(m.creditResetAt, null);
+  });
+});
+
+test('旧在途成功不能提前清除额度阻断，成功仍正常记账', async () => {
+  const state = { topUp: false };
+  const opts = creditMock({ state });
+  const baseRequest = opts.onRequest;
+  let finish;
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { finish = resolve; });
+  let generates = 0;
+  opts.onRequest = async (req, res) => {
+    if (req.url === '/alpha/generate' && ++generates === 1) {
+      started();
+      await gate;
+      return;
+    }
+    return baseRequest(req, res);
+  };
+  await withSetup(opts, async ({ proxy }) => {
+    const a = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_inflight' });
+    const cli = await addClient(proxy, { name: 'c' });
+    await putRouting(proxy, { creditFailoverMax: 0 });
+    const auth = { Authorization: 'Bearer ' + cli.token };
+    const success = proxy.post('/v1/chat/completions', CHAT, auth);
+    await ready;
+    try {
+      assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 400);
+    } finally { finish(); }
+    assert.equal((await success).status, 200);
+    const m = accountOf(await metrics(proxy), a.id);
+    assert.equal(m.creditBlocked, true);
+    assert.equal(m.creditResetAt, Date.parse(state.resetAt));
+    assert.equal(m.cooldownUntil, m.creditResetAt);
+    assert.equal(m.totals.ok, 1);
+    assert.equal(m.totals.fail, 1);
+    assert.equal(m.inFlight, 0);
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, auth)).status, 503);
   });
 });

@@ -98,7 +98,6 @@ function defaultRouting() {
     countTimeoutsAsFailure: true,
     countRateLimitAsFailure: true,
     penalizeAuthErrors: false,              // 401/403 是否计入失败
-    creditCooldownMs: 3600000,              // 额度耗尽 → 立即长冷却（默认 1h）
     creditFailoverMax: 3,                   // 单请求内最多换几个号重试（0 = 关闭换号）
     creditUsageThreshold: 0.95,             // 额度查询已用比例 ≥ 此值 + 上游报错 → 兜底判为额度耗尽
   };
@@ -167,7 +166,6 @@ function normalizeRouting(raw) {
   r.countTimeoutsAsFailure = raw.countTimeoutsAsFailure !== false;
   r.countRateLimitAsFailure = raw.countRateLimitAsFailure !== false;
   r.penalizeAuthErrors = raw.penalizeAuthErrors === true;
-  r.creditCooldownMs = clampNum(raw.creditCooldownMs, d.creditCooldownMs, 60000, 86400000);
   r.creditFailoverMax = Math.floor(clampNum(raw.creditFailoverMax, d.creditFailoverMax, 0, 20));
   r.creditUsageThreshold = clampNum(raw.creditUsageThreshold, d.creditUsageThreshold, 0, 1);
   return r;
@@ -278,7 +276,8 @@ function newRuntime() {
     consecutiveFailures: 0,
     cooldownUntil: 0,
     cooldownLevel: 0,
-    creditExhausted: false,   // 上游判定「额度耗尽」（区别于普通冷却），成功即清除
+    creditExhausted: false,
+    creditResetAt: null,
     lastError: null,
     ewmaTtftMs: 0,
     lastLatencyMs: 0,
@@ -294,7 +293,32 @@ function pruneRuntime() {
   const ids = new Set(STORE.accounts.map(a => a.id));
   for (const id of runtime.keys()) if (!ids.has(id)) runtime.delete(id);
 }
-function resetRuntime(id) { runtime.set(id, newRuntime()); }
+function resetRuntime(id) {
+  const old = getRuntime(id);
+  const next = newRuntime();
+  next.inFlight = old.inFlight;
+  next.creditExhausted = old.creditExhausted;
+  next.creditResetAt = old.creditResetAt;
+  if (old.creditExhausted) next.cooldownUntil = old.creditResetAt || 0;
+  runtime.set(id, next);
+}
+
+function creditResetAtOf(usage) {
+  const sub = usage && usage.subscription;
+  if (!usage?.ok || sub?.status !== 'active' || typeof sub.currentPeriodEnd !== 'string') return null;
+  const at = Date.parse(sub.currentPeriodEnd);
+  return Number.isFinite(at) && at > Date.now() ? at : null;
+}
+
+function expireCreditBlock(r, now) {
+  if (r.creditExhausted && Number.isFinite(r.creditResetAt) && r.creditResetAt <= now) {
+    r.creditExhausted = false;
+    r.creditResetAt = null;
+    r.cooldownUntil = 0;
+    r.cooldownLevel = 0;
+    r.consecutiveFailures = 0;
+  }
+}
 
 function pruneBuckets(r, now, routing) {
   const cutoff = now - routing.windowSizeMs;
@@ -344,7 +368,7 @@ function scoreAccount(account, r, now, routing, maxWeight) {
   const wC = wsum > 0 ? routing.weights.load / wsum : 1 / 3;
   const base = wS * S + wL * L + wC * C;
   const weightFactor = maxWeight > 0 ? account.weight / maxWeight : 1;
-  const score = r.cooldownUntil > now ? 0 : base * weightFactor;
+  const score = r.creditExhausted || r.cooldownUntil > now ? 0 : base * weightFactor;
   return {
     score,
     components: {
@@ -374,7 +398,8 @@ function selectAccount(client) {
   }
   const notSaturated = list.filter(a => {
     const r = getRuntime(a.id);
-    return !(a.maxInflight > 0 && r.inFlight >= a.maxInflight);
+    expireCreditBlock(r, now);
+    return !r.creditExhausted && !(a.maxInflight > 0 && r.inFlight >= a.maxInflight);
   });
   const healthy = notSaturated.filter(a => getRuntime(a.id).cooldownUntil <= now);
   const cooling = notSaturated.filter(a => getRuntime(a.id).cooldownUntil > now);
@@ -433,26 +458,6 @@ function isCreditExhaustedError(status, code, text) {
   return /insufficient[_ ]credits?|purchase more credits|out of credits|credit balance|quota[_ ]exceeded|usage[_ ]exceeded|余额不足|额度不足/i.test(text);
 }
 
-// 上次「额度查询」得到的已用比例（0..1）。不主动打上游 —— 只用已有缓存。
-// 用途：上游报错文案不认识时，用额度数据兜底判断是不是没钱了。
-function cachedUsagePercent(accountId) {
-  if (!accountId) return null;
-  const c = usageCache.get(accountId);
-  if (!c || !c.view || c.view.ok === false) return null;
-  const p = c.view.credits && c.view.credits.usagePercent;
-  return typeof p === 'number' && Number.isFinite(p) ? p : null;
-}
-
-// 账号级「额度耗尽」判定：① 上游明确报 insufficient credits；或
-// ② 额度查询显示已用 ≥ creditUsageThreshold，且上游返回 400/402/403（认证/配额类，非限流/5xx）。
-// ②只在上游**确实返回了错误响应**时生效，因此传输层抖动不会误伤已充值的账号。
-function isCreditExhaustedForAccount(accountId, status, code, text) {
-  if (isCreditExhaustedError(status, code, text)) return true;
-  if (status !== 400 && status !== 402 && status !== 403) return false;
-  const p = cachedUsagePercent(accountId);
-  return p !== null && p >= STORE.routing.creditUsageThreshold;
-}
-
 function releaseAccount(accountId, outcome, latencyMs) {
   const r = getRuntime(accountId);
   if (r.inFlight > 0) r.inFlight--;
@@ -477,25 +482,27 @@ function releaseAccount(accountId, outcome, latencyMs) {
     if (outcome.retried) r.totals.retried++;
     r.consecutiveFailures = 0;
     r.cooldownLevel = 0;
-    r.cooldownUntil = 0;
-    r.creditExhausted = false;
+    if (!r.creditExhausted) r.cooldownUntil = 0;
   } else if (state === 'fail') {
     addSample(r, now, routing, 'fail', null);
     r.totals.fail++;
     r.consecutiveFailures++;
     if (r.consecutiveFailures >= routing.failureCooldownThreshold) {
       const backoff = Math.min(routing.cooldownBaseMs * Math.pow(2, r.cooldownLevel), routing.cooldownMaxMs);
-      r.cooldownUntil = now + backoff;
+      if (!r.creditExhausted) r.cooldownUntil = now + backoff;
       r.cooldownLevel++;
     }
   } else if (state === 'credit_exhausted') {
-    // 额度耗尽不可能在退避窗口内自行恢复：记一次失败，并**立即**给长冷却（不等连续失败阈值）。
-    // 冷却结束后仍会被选中 —— 若用户已充值，成功一次即清除标记；若仍未充值，会再次长冷却。
+    // 仅套餐周期到期可恢复；未知重置时间保持硬阻断。
     addSample(r, now, routing, 'fail', null);
     r.totals.fail++;
     r.consecutiveFailures++;
     r.cooldownLevel = 0;                       // 与普通指数退避解耦，避免下次叠加翻倍
-    r.cooldownUntil = Math.max(r.cooldownUntil, now + routing.creditCooldownMs);
+    // 旧在途结果不能覆盖已登记的较新套餐时间，也不能以未知时间清除它。
+    const resetAt = Number.isFinite(outcome.creditResetAt) ? outcome.creditResetAt : null;
+    r.creditResetAt = r.creditResetAt === null ? resetAt
+      : resetAt === null ? r.creditResetAt : Math.max(r.creditResetAt, resetAt);
+    r.cooldownUntil = r.creditResetAt || 0;
     r.creditExhausted = true;
   } else if (state === 'neutral') {
     r.totals.neutral++;
@@ -508,7 +515,7 @@ function releaseAccount(accountId, outcome, latencyMs) {
  * 这是账号级错误 —— 换账号就能成功，因此在这里释放当前账号（长冷却），并立即用下一个
  * 可用账号重放同一个请求，客户端无感。
  *
- * 返回 { route, apiKey, ccResponse, errorText, mapped, switched, stop }。
+ * 返回 { route, apiKey, ccResponse, errorText, mapped, creditExhausted, switched, stop }。
  * 调用方必须把 route/apiKey/ccResponse/errorText/mapped 回写到自己的局部变量；
  * 若最终响应仍非 2xx，由调用方按原有错误分支返回（此时最后那个账号由外层 finally 记账）。
  *
@@ -516,13 +523,24 @@ function releaseAccount(accountId, outcome, latencyMs) {
  */
 async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, outcome, req, forward }) {
   const routing = STORE.routing;
-  const cur = { route, apiKey, ccResponse, errorText, mapped };
+  const cur = { route, apiKey, ccResponse, errorText, mapped, creditExhausted: false };
   const tried = new Set(route && route.accountId ? [route.accountId] : []);
   let switches = 0;
-  while (cur.ccResponse && !cur.ccResponse.ok
-      && route.mode === 'pool'
-      && switches < routing.creditFailoverMax
-      && isCreditExhaustedForAccount(cur.route.accountId, cur.ccResponse.status, cur.mapped && cur.mapped.code, cur.errorText)) {
+  while (cur.ccResponse && !cur.ccResponse.ok && cur.route.mode === 'pool') {
+    const status = cur.ccResponse.status;
+    cur.creditExhausted = isCreditExhaustedError(status, cur.mapped && cur.mapped.code, cur.errorText);
+    outcome.creditResetAt = null;
+    if (cur.creditExhausted || status === 400 || status === 402 || status === 403) {
+      const account = STORE.accounts.find(a => a.id === cur.route.accountId);
+      if (account) {
+        const usage = await getAccountUsage(account, true);
+        const p = usage.credits && usage.credits.usagePercent;
+        cur.creditExhausted = cur.creditExhausted || (usage.ok === true && typeof p === 'number'
+          && Number.isFinite(p) && p >= routing.creditUsageThreshold);
+        if (cur.creditExhausted) outcome.creditResetAt = creditResetAtOf(usage);
+      }
+    }
+    if (!cur.creditExhausted || switches >= routing.creditFailoverMax) break;
     // 1) 记账：当前账号额度耗尽 → 立即长冷却（不等连续失败阈值）
     outcome.state = 'credit_exhausted';
     outcome.status = cur.ccResponse.status;
@@ -549,8 +567,14 @@ async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, ou
     // 3) 用新账号重放（重置本次尝试的记账状态）
     cur.route = next;
     cur.apiKey = next.upstreamKey;
-    outcome.state = 'pending'; outcome.status = null; outcome.code = null; outcome.message = null; outcome.ttftMs = null;
-    cur.ccResponse = await forward(next.upstreamKey);
+    outcome.state = 'pending'; outcome.status = null; outcome.code = null; outcome.message = null; outcome.ttftMs = null; outcome.creditResetAt = null;
+    cur.creditExhausted = false;
+    try {
+      cur.ccResponse = await forward(next.upstreamKey);
+    } catch (e) {
+      next.release({ state: 'fail', status: 502, message: 'Upstream forwarding failed' }, null);
+      throw e;
+    }
     cur.errorText = cur.ccResponse.ok ? '' : await cur.ccResponse.text().catch(() => '');
     cur.mapped = cur.ccResponse.ok ? null : mapCcError(cur.ccResponse.status, cur.errorText);
   }
@@ -2005,7 +2029,7 @@ async function handleChatCompletions(req, res) {
       route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
       errorText = fo.errorText; mapped = fo.mapped;
       if (!ccResponse.ok) {
-        outcome.state = isCreditExhaustedForAccount(route.accountId, ccResponse.status, mapped && mapped.code, errorText)
+        outcome.state = fo.creditExhausted
           ? 'credit_exhausted'
           : classifyUpstreamStatus(ccResponse.status);
         outcome.status = ccResponse.status;
@@ -3033,7 +3057,7 @@ async function handleMessages(req, res) {
       route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
       errorText = fo.errorText; mapped = fo.mapped;
       if (!ccResponse.ok) {
-        outcome.state = isCreditExhaustedForAccount(route.accountId, ccResponse.status, mapped && mapped.code, errorText)
+        outcome.state = fo.creditExhausted
           ? 'credit_exhausted'
           : classifyUpstreamStatus(ccResponse.status);
         outcome.status = ccResponse.status;
@@ -4057,7 +4081,7 @@ async function handleResponses(req, res) {
       route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
       errorText = fo.errorText; mapped = fo.mapped;
       if (!ccResponse.ok) {
-        outcome.state = isCreditExhaustedForAccount(route.accountId, ccResponse.status, mapped && mapped.code, errorText)
+        outcome.state = fo.creditExhausted
           ? 'credit_exhausted'
           : classifyUpstreamStatus(ccResponse.status);
         outcome.status = ccResponse.status;
@@ -4486,6 +4510,7 @@ const PLAN_NAMES = {
 };
 const PLAN_KEYS = Object.keys(PLAN_TOTAL_CREDITS).sort((a, b) => b.length - a.length);
 const usageCache = new Map();  // accountId → { at, view }
+const usageInFlight = new Map();  // accountId → Promise
 
 function planInfoOf(planId) {
   if (!planId || typeof planId !== 'string') return null;
@@ -4565,31 +4590,40 @@ async function fetchAccountUsage(account) {
   };
 }
 async function getAccountUsage(account, force) {
+  const pending = usageInFlight.get(account.id);
+  if (pending) return pending;
   const cached = usageCache.get(account.id);
   if (!force && cached && Date.now() - cached.at < USAGE_TTL_MS) return cached.view;
-  let view;
-  try {
-    const data = await fetchAccountUsage(account);
-    view = { id: account.id, name: account.name, enabled: account.enabled, ...data };
-    // 额度查询确认余额已恢复（已用比例低于阈值）→ 立即解除额度耗尽冷却，不必等冷却到期
-    const p = view.credits && view.credits.usagePercent;
-    if (typeof p === 'number' && p < STORE.routing.creditUsageThreshold) {
+  const query = (async () => {
+    let view;
+    try {
+      const data = await fetchAccountUsage(account);
+      view = { id: account.id, name: account.name, enabled: account.enabled, ...data };
       const rt = getRuntime(account.id);
-      if (rt.creditExhausted) {
-        rt.creditExhausted = false; rt.cooldownUntil = 0; rt.cooldownLevel = 0; rt.consecutiveFailures = 0;
-        log('info', 'Account credit cooldown cleared by usage check', { account: account.name });
+      const resetAt = creditResetAtOf(view);
+      // 查询只补充套餐时间，不因余额变化解锁；已到期的周期交由选路解除。
+      if (rt.creditExhausted && resetAt !== null
+          && (rt.creditResetAt === null || rt.creditResetAt > Date.now())) {
+        rt.creditResetAt = rt.creditResetAt === null ? resetAt : Math.max(rt.creditResetAt, resetAt);
+        rt.cooldownUntil = rt.creditResetAt;
       }
+    } catch (e) {
+      const status = e && e.status;
+      view = {
+        id: account.id, name: account.name, enabled: account.enabled, ok: false,
+        error: e && e.name === 'TimeoutError' ? 'timeout' : (status ? 'upstream_' + status : 'network_error'),
+        fetchedAt: new Date().toISOString(),
+      };
     }
-  } catch (e) {
-    const status = e && e.status;
-    view = {
-      id: account.id, name: account.name, enabled: account.enabled, ok: false,
-      error: e && e.name === 'TimeoutError' ? 'timeout' : (status ? 'upstream_' + status : 'network_error'),
-      fetchedAt: new Date().toISOString(),
-    };
+    usageCache.set(account.id, { at: Date.now(), view });
+    return view;
+  })();
+  usageInFlight.set(account.id, query);
+  try {
+    return await query;
+  } finally {
+    usageInFlight.delete(account.id);
   }
-  usageCache.set(account.id, { at: Date.now(), view });
-  return view;
 }
 async function allAccountsUsage(force) {
   const items = STORE.accounts.slice();
@@ -4952,8 +4986,8 @@ function accountCard(a,m){
   addRow(rows,'平均 TTFT',msfmt(wr?wr.avgTtftMs:0));
   addRow(rows,'在途',String(m?m.inFlight:0));
   addRow(rows,'评分',(m&&m.score!==undefined)?m.score.toFixed(3):'—');
-  addRow(rows,'冷却',(m&&m.cooling)?('剩余 '+fmtDur(m.cooldownUntil-Date.now())):'否');
-  if(m&&m.creditExhausted)addRow(rows,'额度','耗尽（已长冷却，充值后自动恢复）');
+  addRow(rows,'冷却',(m&&m.cooling)?(m.creditResetUnknown?'套餐重置时间未知':('剩余 '+fmtDur(m.cooldownUntil-Date.now()))):'否');
+  if(m&&m.creditExhausted)addRow(rows,'额度',m.creditResetAt?'耗尽（到套餐重置时间恢复：'+new Date(m.creditResetAt).toLocaleString()+'）':'耗尽（套餐重置时间未知，保持停用）');
   c.appendChild(rows);
   if(m&&m.lastError){append(c,el('div','key','最后错误: '+(m.lastError.status||'')+' '+(m.lastError.code||m.lastError.message||'')));}
   var sw=el('label','switch');var cb=el('input');cb.type='checkbox';cb.checked=!!a.enabled;
@@ -5124,10 +5158,9 @@ function renderRouting(root){
   var pCb=fieldInput('冷却基数 cooldownBaseMs',R.cooldownBaseMs||30000,'number');
   var pCm=fieldInput('冷却上限 cooldownMaxMs',R.cooldownMaxMs||300000,'number');
   var pTh=fieldInput('连续失败阈值 failureCooldownThreshold',R.failureCooldownThreshold||3,'number');
-  var pCc=fieldInput('额度耗尽冷却 creditCooldownMs',R.creditCooldownMs||3600000,'number');
   var pCf=fieldInput('额度换号上限 creditFailoverMax',R.creditFailoverMax!==undefined?R.creditFailoverMax:3,'number');
   var pCu=fieldInput('额度兜底阈值 creditUsageThreshold',R.creditUsageThreshold!==undefined?R.creditUsageThreshold:0.95,'number');
-  [pSel.el,pWin.el,pAlpha.el,pPsr.el,pEwma.el,pFloor.el,pCeil.el,pUnk.el,pRef.el,pCb.el,pCm.el,pTh.el,pCc.el,pCf.el,pCu.el].forEach(function(x){g.appendChild(x);});
+  [pSel.el,pWin.el,pAlpha.el,pPsr.el,pEwma.el,pFloor.el,pCeil.el,pUnk.el,pRef.el,pCb.el,pCm.el,pTh.el,pCf.el,pCu.el].forEach(function(x){g.appendChild(x);});
   append(card,g);
   append(card,el('h3',null,'策略预览（按当前滑杆值实时计算）'));
   var prevBox=el('div');append(card,prevBox);
@@ -5147,7 +5180,6 @@ function renderRouting(root){
       cooldownBaseMs:Number(pCb.inp.value),
       cooldownMaxMs:Number(pCm.inp.value),
       failureCooldownThreshold:Number(pTh.inp.value),
-      creditCooldownMs:Number(pCc.inp.value),
       creditFailoverMax:Number(pCf.inp.value),
       creditUsageThreshold:Number(pCu.inp.value),
       weights:{successRate:Number(sS.inp.value)/100,latency:Number(sL.inp.value)/100,load:Number(sC.inp.value)/100}
@@ -5577,7 +5609,7 @@ async function handleAdmin(req, res, url) {
         const r = getRuntime(a.id);
         const st = windowStats(r, now, routing);
         const { score, components } = scoreAccount(a, r, now, routing, maxWeight);
-        if (a.enabled) { if (r.cooldownUntil > now) cooling++; else healthy++; }
+        if (a.enabled) { if (r.creditExhausted || r.cooldownUntil > now) cooling++; else healthy++; }
         return {
           id: a.id, name: a.name, enabled: a.enabled, weight: a.weight,
           score, components,
@@ -5586,8 +5618,11 @@ async function handleAdmin(req, res, url) {
           inFlight: r.inFlight,
           consecutiveFailures: r.consecutiveFailures,
           cooldownUntil: r.cooldownUntil,
-          cooling: r.cooldownUntil > now,
+          cooling: r.creditExhausted || r.cooldownUntil > now,
           creditExhausted: !!r.creditExhausted,
+          creditResetAt: r.creditResetAt,
+          creditBlocked: !!r.creditExhausted,
+          creditResetUnknown: !!r.creditExhausted && r.creditResetAt === null,
           ewmaTtftMs: r.ewmaTtftMs,
           lastLatencyMs: r.lastLatencyMs,
           lastError: r.lastError,
