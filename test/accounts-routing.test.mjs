@@ -356,3 +356,176 @@ test('额度查看：/admin/api/accounts/:id/usage 单账号；上游异常降�
     assert.equal(missing.status, 404);
   });
 });
+
+// 额度耗尽 mock：/alpha/generate 上「穷」key 返回 400 insufficient credits，其余放行
+function creditMock(opts = {}) {
+  return {
+    env: { CC_ADMIN_TOKEN: ADMIN_TOKEN },
+    ...opts,
+    onRequest(req, res) {
+      if (req.url !== '/alpha/generate') return; // 初始化预请求走默认 200
+      const auth = String(req.headers.authorization || '');
+      if (opts.rejectAll || auth.includes('poor_')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: false,
+          error: { code: 'USAGE_EXCEEDED', message: 'You have insufficient credits to make this request. Please purchase more credits to continue using the service.' },
+        }));
+      }
+    },
+  };
+}
+const putRouting = (proxy, body) =>
+  admin(proxy, 'PUT', '/admin/api/routing', body).then(r => r.json());
+const accountOf = (m, id) => m.accounts.find(a => a.id === id);
+
+// ── 19. 额度耗尽 → 同请求自动换号（客户端无感）+ 长冷却 ──────
+test('额度耗尽：同请求自动换号成功，耗尽账号进入长冷却', async () => {
+  await withSetup(creditMock(), async ({ proxy, mock }) => {
+    const poor = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_AAA', weight: 10 });
+    const rich = await addAccount(proxy, { name: 'rich', apiKey: 'user_rich_BBB', weight: 1 });
+    await putRouting(proxy, { selection: 'best' });
+    const cli = await addClient(proxy, { name: 'c' });
+
+    const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    assert.equal(r.status, 200, await r.text());
+    assert.equal(countAuth(mock, 'user_poor_AAA'), 1, 'poor account must be tried exactly once');
+    assert.equal(routeAuth(mock), 'Bearer user_rich_BBB', 'final attempt must use the rich account');
+
+    const m = await metrics(proxy);
+    const mp = accountOf(m, poor.id), mr = accountOf(m, rich.id);
+    assert.equal(mp.creditExhausted, true);
+    assert.equal(mp.cooling, true);
+    assert.ok(mp.cooldownUntil - Date.now() > 60000, 'credit cooldown should be long (default 1h)');
+    assert.equal(mr.creditExhausted, false);
+  });
+});
+
+// ── 20. 全部账号额度耗尽 → 返回错误，且都被长冷却 ────────────
+test('额度耗尽：全部账号耗尽时透出上游 400，且账号都在长冷却', async () => {
+  await withSetup(creditMock({ rejectAll: true }), async ({ proxy }) => {
+    const a1 = await addAccount(proxy, { name: 'a1', apiKey: 'user_poor_A1', weight: 10 });
+    const a2 = await addAccount(proxy, { name: 'a2', apiKey: 'user_poor_A2', weight: 1 });
+    await putRouting(proxy, { selection: 'best' });
+    const cli = await addClient(proxy, { name: 'c' });
+
+    const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    assert.equal(r.status, 400);
+    const m = await metrics(proxy);
+    for (const id of [a1.id, a2.id]) {
+      assert.equal(accountOf(m, id).creditExhausted, true);
+      assert.equal(accountOf(m, id).cooling, true);
+    }
+  });
+});
+
+// ── 21. creditFailoverMax=0 → 不换号但仍长冷却 ──────────────
+test('额度耗尽：creditFailoverMax=0 时不换号，但仍立即长冷却', async () => {
+  await withSetup(creditMock({ rejectAll: true }), async ({ proxy, mock }) => {
+    const a1 = await addAccount(proxy, { name: 'a1', apiKey: 'user_poor_A1', weight: 10 });
+    await putRouting(proxy, { selection: 'best', creditFailoverMax: 0 });
+    const cli = await addClient(proxy, { name: 'c' });
+
+    const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    assert.equal(r.status, 400);
+    assert.equal(countAuth(mock, 'user_poor_A1'), 1, 'no failover attempt expected');
+    const mm = accountOf(await metrics(proxy), a1.id);
+    assert.equal(mm.creditExhausted, true);
+    assert.equal(mm.cooling, true);
+  });
+});
+
+// ── 22. /v1/messages 走同一套换号逻辑 ───────────────────────
+test('额度耗尽：/v1/messages 同样自动换号', async () => {
+  await withSetup(creditMock(), async ({ proxy, mock }) => {
+    const poor = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_M', weight: 10 });
+    await addAccount(proxy, { name: 'rich', apiKey: 'user_rich_M', weight: 1 });
+    await putRouting(proxy, { selection: 'best' });
+    const cli = await addClient(proxy, { name: 'c' });
+
+    const r = await proxy.post('/v1/messages',
+      { model: 'm', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] },
+      { Authorization: 'Bearer ' + cli.token });
+    assert.equal(r.status, 200, await r.text());
+    assert.equal(countAuth(mock, 'user_poor_M'), 1);
+    assert.equal(routeAuth(mock), 'Bearer user_rich_M');
+    assert.equal(accountOf(await metrics(proxy), poor.id).creditExhausted, true);
+  });
+});
+
+// 额度查询 mock：可切换「已充值」；穷号余额 0.10/套餐 10 → 已用 99%
+function creditUsageMock(opts = {}) {
+  const state = opts.state || { topUp: false };   // 由调用方持有，可在中途改（模拟充值）
+  const json = (res, o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+  return {
+    state,
+    env: { CC_ADMIN_TOKEN: ADMIN_TOKEN },
+    ...opts,
+    onRequest(req, res) {
+      const u = req.url;
+      const auth = String(req.headers.authorization || '');
+      const poor = auth.includes('poor_');
+      // 上游 400 用「不认识」的文案，逼出额度兜底判定（而非文案匹配）
+      if (u === '/alpha/generate' && poor) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 'INVALID_ARGUMENT', message: 'request rejected by upstream' } }));
+        return;
+      }
+      if (u.startsWith('/alpha/whoami')) return json(res, { org: { id: 'org_1', login: 'acme' }, user: { userName: 'u1' }, orgLimits: [] });
+      if (u.startsWith('/alpha/billing/credits')) {
+        const remain = (state.topUp || !poor) ? 10 : 0.10;
+        return json(res, { credits: { planId: 'individual-go', monthlyCredits: remain, purchasedCredits: 0, freeCredits: 0 } });
+      }
+      if (u.startsWith('/alpha/billing/subscriptions')) {
+        return json(res, { data: { planId: 'individual-go', status: 'active', currentPeriodStart: '2026-10-01T00:00:00Z', currentPeriodEnd: '2026-11-01T00:00:00Z' } });
+      }
+      if (u.startsWith('/alpha/usage/summary')) return json(res, { totalCost: 0 });
+    },
+  };
+}
+
+// ── 23. 额度兜底：已用≥95% + 非标准 400 → 判为额度耗尽并换号 ──
+test('额度兜底：已用≥95% 且上游 400（文案不认识）时也换号并长冷却', async () => {
+  await withSetup(creditUsageMock(), async ({ proxy, mock }) => {
+    const poor = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_U', weight: 10 });
+    const rich = await addAccount(proxy, { name: 'rich', apiKey: 'user_rich_U', weight: 1 });
+    await putRouting(proxy, { selection: 'best' });
+    const cli = await addClient(proxy, { name: 'c' });
+
+    // 先播种额度缓存（穷号已用 99%）
+    const seeded = await admin(proxy, 'GET', '/admin/api/usage');
+    const pv = (await seeded.json()).usage.find(x => x.id === poor.id);
+    assert.ok(pv.credits.usagePercent >= 0.95, 'mock poor account should be >=95% used');
+
+    const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    assert.equal(r.status, 200, await r.text());
+    assert.equal(countAuth(mock, 'user_poor_U'), 1);
+    assert.equal(routeAuth(mock), 'Bearer user_rich_U', 'should fail over despite unknown error text');
+    const mm = accountOf(await metrics(proxy), poor.id);
+    assert.equal(mm.creditExhausted, true);
+    assert.equal(mm.cooling, true);
+  });
+});
+
+// ── 24. 充值后刷新额度 → 立即解除额度耗尽冷却 ────────────────
+test('额度兜底：额度查询确认已充值后立即解除冷却，无需等满 1 小时', async () => {
+  const state = { topUp: false };
+  await withSetup(creditUsageMock({ state }), async ({ proxy }) => {
+    const poor = await addAccount(proxy, { name: 'poor', apiKey: 'user_poor_U', weight: 10 });
+    await addAccount(proxy, { name: 'rich', apiKey: 'user_rich_U', weight: 1 });
+    await putRouting(proxy, { selection: 'best' });
+    const cli = await addClient(proxy, { name: 'c' });
+    await admin(proxy, 'GET', '/admin/api/usage');   // 播种 99% 已用
+
+    const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    assert.equal(r.status, 200);
+    assert.equal(accountOf(await metrics(proxy), poor.id).cooling, true, 'should be cooling before top-up');
+
+    // 充值后强制刷新额度 → 冷却立即解除
+    state.topUp = true;
+    await admin(proxy, 'GET', '/admin/api/usage?refresh=1');
+    const after = accountOf(await metrics(proxy), poor.id);
+    assert.equal(after.creditExhausted, false, 'credit flag must be cleared');
+    assert.equal(after.cooling, false, 'cooldown must be lifted after top-up');
+  });
+});

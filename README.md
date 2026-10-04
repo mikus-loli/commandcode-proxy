@@ -559,7 +559,8 @@ client --(ccp_ token)--> handler
     "latencyEwmaAlpha": 0.3, "latencyFloorMs": 400, "latencyCeilMs": 60000,
     "unknownLatencyScore": 0.5, "loadReference": 4,
     "cooldownBaseMs": 30000, "cooldownMaxMs": 300000, "failureCooldownThreshold": 3,
-    "countTimeoutsAsFailure": true, "countRateLimitAsFailure": true, "penalizeAuthErrors": false }
+    "countTimeoutsAsFailure": true, "countRateLimitAsFailure": true, "penalizeAuthErrors": false,
+    "creditCooldownMs": 3600000, "creditFailoverMax": 3, "creditUsageThreshold": 0.95 }
 }
 ```
 
@@ -587,6 +588,24 @@ fail-opens to the earliest-expiring one instead of returning 503. Metrics reset 
 
 **Success-rate windows are bucketed in memory** (`windowSizeMs / bucketMs`), so cost is O(accounts).
 
+**Out-of-credits failover**: when an account runs out of credits the upstream answers `400` +
+`insufficient credits` (or `error.code = USAGE_EXCEEDED`). That is an **account-level** error — another
+account would succeed — so it must be told apart from a client-side `400`. The proxy records a failure
+and puts that account into a **long** cooldown `creditCooldownMs` (default 1h, not gated by
+`failureCooldownThreshold`), then **replays the same request** on the next available account so the
+client never sees the error. At most `creditFailoverMax` switches per request (default 3; `0` disables
+the switch and keeps only the long cooldown). Only when *every* account is exhausted does the upstream
+error surface to the client. Once the cooldown expires the account is eligible again — a single success
+clears the "out of credits" flag (e.g. after a top-up), otherwise it cools down again.
+
+**Usage-aware fallback & recovery**: if an existing credits-query cache reports usage at or above
+`creditUsageThreshold` (default `0.95`) and the upstream returns `400`/`402`/`403`, the proxy also treats
+that failure as out of credits even when the error wording is unrecognized. Network errors, `429`,
+and `5xx` do not trigger this fallback. Populate the cache through the credits tab or usage API;
+generation failures do not themselves fetch fresh usage. A successful fresh credits query reporting
+usage below the threshold immediately clears the credit cooldown, so after a top-up you can refresh
+the credits tab instead of waiting for the cooldown to expire.
+
 **Accounting (one terminal outcome per client request — internal retries do not double-count):**
 
 | Terminal state | Recorded as |
@@ -594,6 +613,7 @@ fail-opens to the earliest-expiring one instead of returning 503. Metrics reset 
 | Stream completed / non-stream `200` | ok (`attempt>1` and delivered → ok + `retried`) |
 | Upstream `429`/`402`→`429`, zero-output `429`, idle-timeout `429` | fail |
 | Truncated without finish → `502`, transport `502`, upstream `5xx`/`503` | fail |
+| Upstream `400`/`402`/`403` classified as **out of credits** (`insufficient credits` / `USAGE_EXCEEDED`, or cached usage ≥ `creditUsageThreshold`) | credit_exhausted → long cooldown + replay on another account |
 | Upstream `400`/`404`/`422` (client error, another account won't help) | not counted |
 | Upstream `401`/`403` | only `lastError`, counted per `penalizeAuthErrors` |
 | Client aborted | not counted (in-flight still released) |

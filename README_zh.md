@@ -553,7 +553,8 @@ CLI 发送图片的格式：
     "latencyEwmaAlpha": 0.3, "latencyFloorMs": 400, "latencyCeilMs": 60000,
     "unknownLatencyScore": 0.5, "loadReference": 4,
     "cooldownBaseMs": 30000, "cooldownMaxMs": 300000, "failureCooldownThreshold": 3,
-    "countTimeoutsAsFailure": true, "countRateLimitAsFailure": true, "penalizeAuthErrors": false }
+    "countTimeoutsAsFailure": true, "countRateLimitAsFailure": true, "penalizeAuthErrors": false,
+    "creditCooldownMs": 3600000, "creditFailoverMax": 3, "creditUsageThreshold": 0.95 }
 }
 ```
 
@@ -578,6 +579,21 @@ CLI 发送图片的格式：
 
 **成功率用内存分桶滚动窗口**（`windowSizeMs / bucketMs`），成本 O(账号数)。
 
+**额度耗尽自动换号**：上游对「本账号没钱了」返回 `400` + `insufficient credits`
+（或 `error.code = USAGE_EXCEEDED`）。这是**账号级**错误 —— 换账号就能成功，与「客户端请求错」
+的 `400` 必须区分。代理的处理是：把当前账号记一次失败并**立即**进入长冷却 `creditCooldownMs`
+（默认 1h，不等 `failureCooldownThreshold`），再用下一个可用账号**在同一个请求内重放**，
+客户端无感；单请求最多换 `creditFailoverMax` 个号（默认 3，`0` 关闭换号、只保留长冷却）。
+全部账号都耗尽时，才把上游错误原样透出。冷却结束后账号会重新参与选择 —— 充值后成功一次即自动清除
+「额度耗尽」标记；仍未充值则再次长冷却。
+
+**额度数据兜底（配合「额度」页签的查询结果）**：上游报错文案不认识时，用上次额度查询的
+**已用比例**兜底 —— 若某账号已用 ≥ `creditUsageThreshold`（默认 `0.95`，即余额只剩不到 5%），
+且上游确实返回了 `400`/`402`/`403`，同样判为额度耗尽并换号 + 长冷却。该兜底只在上游**确实返回错误响应**
+时生效（传输层抖动、`5xx`、`429` 都不会触发），因此不会误伤临时抖动的账号。
+反向地，**额度查询一旦确认余额已恢复**（已用比例低于阈值），会立即解除该账号的额度耗尽冷却，
+不必等满 `creditCooldownMs` —— 充值后到「额度」页签点一次刷新即可恢复使用。
+
 **记账口径（一次客户端请求只记一次终态，内部重试不重复记账）：**
 
 | 终态 | 记账 |
@@ -585,6 +601,7 @@ CLI 发送图片的格式：
 | 流式正常收尾 / 非流式 `200` | ok（`attempt>1` 且已交付 → ok + `retried`）|
 | 上游 `429`/`402`→`429`、零输出 `429`、空闲超时 `429` | fail |
 | 截断无 finish → `502`、传输层 `502`、上游 `5xx`/`503` | fail |
+| 上游 `400`/`402`/`403` 且判定为**额度耗尽**（`insufficient credits`/`USAGE_EXCEEDED`，或已用比例 ≥ `creditUsageThreshold`）| credit_exhausted → 立即长冷却 + 换号重放 |
 | 上游 `400`/`404`/`422`（客户端请求错，换账号一样）| 不计 |
 | 上游 `401`/`403` | 仅记 `lastError`，按 `penalizeAuthErrors` 决定是否计入 |
 | 客户端断连 | 不计（仅释放 in-flight）|

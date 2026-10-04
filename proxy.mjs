@@ -98,6 +98,9 @@ function defaultRouting() {
     countTimeoutsAsFailure: true,
     countRateLimitAsFailure: true,
     penalizeAuthErrors: false,              // 401/403 是否计入失败
+    creditCooldownMs: 3600000,              // 额度耗尽 → 立即长冷却（默认 1h）
+    creditFailoverMax: 3,                   // 单请求内最多换几个号重试（0 = 关闭换号）
+    creditUsageThreshold: 0.95,             // 额度查询已用比例 ≥ 此值 + 上游报错 → 兜底判为额度耗尽
   };
 }
 
@@ -164,6 +167,9 @@ function normalizeRouting(raw) {
   r.countTimeoutsAsFailure = raw.countTimeoutsAsFailure !== false;
   r.countRateLimitAsFailure = raw.countRateLimitAsFailure !== false;
   r.penalizeAuthErrors = raw.penalizeAuthErrors === true;
+  r.creditCooldownMs = clampNum(raw.creditCooldownMs, d.creditCooldownMs, 60000, 86400000);
+  r.creditFailoverMax = Math.floor(clampNum(raw.creditFailoverMax, d.creditFailoverMax, 0, 20));
+  r.creditUsageThreshold = clampNum(raw.creditUsageThreshold, d.creditUsageThreshold, 0, 1);
   return r;
 }
 
@@ -272,6 +278,7 @@ function newRuntime() {
     consecutiveFailures: 0,
     cooldownUntil: 0,
     cooldownLevel: 0,
+    creditExhausted: false,   // 上游判定「额度耗尽」（区别于普通冷却），成功即清除
     lastError: null,
     ewmaTtftMs: 0,
     lastLatencyMs: 0,
@@ -417,6 +424,35 @@ function classifyUpstreamStatus(status) {
   return 'fail';
 }
 
+// 「额度耗尽」是**账号级**错误：上游用 400/402 表示，但换账号就能成功。
+// 必须与「客户端请求错」的 400 区分开，否则账号不会被惩罚，路由会一直选中它（见 releaseAccount）。
+function isCreditExhaustedError(status, code, text) {
+  if (code && /USAGE_EXCEEDED|INSUFFICIENT_?CREDITS?|QUOTA_EXCEEDED|CREDIT_?EXHAUSTED/i.test(String(code))) return true;
+  if (status !== 400 && status !== 402 && status !== 403) return false;
+  if (!text) return false;
+  return /insufficient[_ ]credits?|purchase more credits|out of credits|credit balance|quota[_ ]exceeded|usage[_ ]exceeded|余额不足|额度不足/i.test(text);
+}
+
+// 上次「额度查询」得到的已用比例（0..1）。不主动打上游 —— 只用已有缓存。
+// 用途：上游报错文案不认识时，用额度数据兜底判断是不是没钱了。
+function cachedUsagePercent(accountId) {
+  if (!accountId) return null;
+  const c = usageCache.get(accountId);
+  if (!c || !c.view || c.view.ok === false) return null;
+  const p = c.view.credits && c.view.credits.usagePercent;
+  return typeof p === 'number' && Number.isFinite(p) ? p : null;
+}
+
+// 账号级「额度耗尽」判定：① 上游明确报 insufficient credits；或
+// ② 额度查询显示已用 ≥ creditUsageThreshold，且上游返回 400/402/403（认证/配额类，非限流/5xx）。
+// ②只在上游**确实返回了错误响应**时生效，因此传输层抖动不会误伤已充值的账号。
+function isCreditExhaustedForAccount(accountId, status, code, text) {
+  if (isCreditExhaustedError(status, code, text)) return true;
+  if (status !== 400 && status !== 402 && status !== 403) return false;
+  const p = cachedUsagePercent(accountId);
+  return p !== null && p >= STORE.routing.creditUsageThreshold;
+}
+
 function releaseAccount(accountId, outcome, latencyMs) {
   const r = getRuntime(accountId);
   if (r.inFlight > 0) r.inFlight--;
@@ -442,6 +478,7 @@ function releaseAccount(accountId, outcome, latencyMs) {
     r.consecutiveFailures = 0;
     r.cooldownLevel = 0;
     r.cooldownUntil = 0;
+    r.creditExhausted = false;
   } else if (state === 'fail') {
     addSample(r, now, routing, 'fail', null);
     r.totals.fail++;
@@ -451,10 +488,73 @@ function releaseAccount(accountId, outcome, latencyMs) {
       r.cooldownUntil = now + backoff;
       r.cooldownLevel++;
     }
+  } else if (state === 'credit_exhausted') {
+    // 额度耗尽不可能在退避窗口内自行恢复：记一次失败，并**立即**给长冷却（不等连续失败阈值）。
+    // 冷却结束后仍会被选中 —— 若用户已充值，成功一次即清除标记；若仍未充值，会再次长冷却。
+    addSample(r, now, routing, 'fail', null);
+    r.totals.fail++;
+    r.consecutiveFailures++;
+    r.cooldownLevel = 0;                       // 与普通指数退避解耦，避免下次叠加翻倍
+    r.cooldownUntil = Math.max(r.cooldownUntil, now + routing.creditCooldownMs);
+    r.creditExhausted = true;
   } else if (state === 'neutral') {
     r.totals.neutral++;
   }
   // aborted / pending：仅释放 inFlight，不记成败
+}
+
+/**
+ * 额度耗尽换号：上游对「本账号没钱了」用 400/402 + insufficient credits 表达。
+ * 这是账号级错误 —— 换账号就能成功，因此在这里释放当前账号（长冷却），并立即用下一个
+ * 可用账号重放同一个请求，客户端无感。
+ *
+ * 返回 { route, apiKey, ccResponse, errorText, mapped, switched, stop }。
+ * 调用方必须把 route/apiKey/ccResponse/errorText/mapped 回写到自己的局部变量；
+ * 若最终响应仍非 2xx，由调用方按原有错误分支返回（此时最后那个账号由外层 finally 记账）。
+ *
+ * forward: async (apiKey) => Response  —— 负责 ensureInitialized + forwardToCC 的重放闭包。
+ */
+async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, outcome, req, forward }) {
+  const routing = STORE.routing;
+  const cur = { route, apiKey, ccResponse, errorText, mapped };
+  const tried = new Set(route && route.accountId ? [route.accountId] : []);
+  let switches = 0;
+  while (cur.ccResponse && !cur.ccResponse.ok
+      && route.mode === 'pool'
+      && switches < routing.creditFailoverMax
+      && isCreditExhaustedForAccount(cur.route.accountId, cur.ccResponse.status, cur.mapped && cur.mapped.code, cur.errorText)) {
+    // 1) 记账：当前账号额度耗尽 → 立即长冷却（不等连续失败阈值）
+    outcome.state = 'credit_exhausted';
+    outcome.status = cur.ccResponse.status;
+    outcome.code = (cur.mapped && cur.mapped.code) || null;
+    outcome.message = (cur.mapped && cur.mapped.body && cur.mapped.body.error && cur.mapped.body.error.message) || null;
+    cur.route.release(outcome, null);
+    // 2) 换下一个账号（刚冷却的账号已被 selectAccount 排除）
+    const next = resolveRoute(req.headers);
+    if (!next || next.error) {
+      log('warn', 'Credit failover stopped: no other account available', { used: switches });
+      return { ...cur, switched: switches, stop: true };
+    }
+    if (next.accountId && tried.has(next.accountId)) {
+      next.release({ state: 'pending' }, null);   // 只剩同一个账号可选，再试也无意义
+      log('warn', 'Credit failover stopped: only the exhausted account is available', { used: switches });
+      return { ...cur, switched: switches, stop: true };
+    }
+    if (next.accountId) tried.add(next.accountId);
+    switches++;
+    log('warn', 'Upstream account out of credits - retrying with another account', {
+      status: cur.ccResponse.status, code: outcome.code, attempt: switches,
+      from: cur.route.accountId || null, to: next.accountId || null,
+    });
+    // 3) 用新账号重放（重置本次尝试的记账状态）
+    cur.route = next;
+    cur.apiKey = next.upstreamKey;
+    outcome.state = 'pending'; outcome.status = null; outcome.code = null; outcome.message = null; outcome.ttftMs = null;
+    cur.ccResponse = await forward(next.upstreamKey);
+    cur.errorText = cur.ccResponse.ok ? '' : await cur.ccResponse.text().catch(() => '');
+    cur.mapped = cur.ccResponse.ok ? null : mapCcError(cur.ccResponse.status, cur.errorText);
+  }
+  return { ...cur, switched: switches, stop: false };
 }
 
 // ── 凭据解析（池 / legacy 直通） ────────────────────────
@@ -1817,7 +1917,7 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const route = resolveRoute(req.headers);
+  let route = resolveRoute(req.headers);
   if (route && route.error === 'no_available_account') {
     res.setHeader('Retry-After', '5');
     sendJSON(res, 503, { error: { message: 'No available upstream account for this token', type: 'no_available_account' }, retry_after: 5 });
@@ -1827,8 +1927,8 @@ async function handleChatCompletions(req, res) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
-  const apiKey = route.upstreamKey;
-  const outcome = { state: 'pending', ttftMs: null, status: null, code: null };
+  let apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
   const startTime = Date.now();
   const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   try {
@@ -1889,17 +1989,32 @@ async function handleChatCompletions(req, res) {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
 
     if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      const mapped = mapCcError(ccResponse.status, errorText);
-      outcome.state = classifyUpstreamStatus(ccResponse.status);
-      outcome.status = ccResponse.status;
-      outcome.code = mapped.code || null;
-      log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendJSON(res, mapped.status, mapped.body);
-      return;
+      let errorText = await ccResponse.text().catch(() => '');
+      let mapped = mapCcError(ccResponse.status, errorText);
+      // 额度耗尽 → 换号重放（客户端无感）；其余错误照旧返回
+      const fo = await creditFailover({
+        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        forward: async (key) => {
+          await ensureInitialized(key, abortController.signal);
+          return forwardToCC(ccBody, key, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+        },
+      });
+      route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
+      errorText = fo.errorText; mapped = fo.mapped;
+      if (!ccResponse.ok) {
+        outcome.state = isCreditExhaustedForAccount(route.accountId, ccResponse.status, mapped && mapped.code, errorText)
+          ? 'credit_exhausted'
+          : classifyUpstreamStatus(ccResponse.status);
+        outcome.status = ccResponse.status;
+        outcome.code = mapped.code || null;
+        outcome.message = (mapped.body && mapped.body.error && mapped.body.error.message) || null;
+        log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
+        sendJSON(res, mapped.status, mapped.body);
+        return;
+      }
     }
 
     // 下游断连检测：打断 CC 上游 + 记录日志（只在首次尝试注册，重试不重复挂载监听器）
@@ -2871,7 +2986,7 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const route = resolveRoute(req.headers);
+  let route = resolveRoute(req.headers);
   if (route && route.error === 'no_available_account') {
     res.setHeader('Retry-After', '5');
     sendJSON(res, 503, { type: 'error', error: { type: 'no_available_account', message: 'No available upstream account for this token' }, retry_after: 5 });
@@ -2881,8 +2996,8 @@ async function handleMessages(req, res) {
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
-  const apiKey = route.upstreamKey;
-  const outcome = { state: 'pending', ttftMs: null, status: null, code: null };
+  let apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
@@ -2903,17 +3018,31 @@ async function handleMessages(req, res) {
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      const mapped = mapCcError(ccResponse.status, errorText);
-      outcome.state = classifyUpstreamStatus(ccResponse.status);
-      outcome.status = ccResponse.status;
-      outcome.code = mapped.code || null;
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
-      return;
+      let errorText = await ccResponse.text().catch(() => '');
+      let mapped = mapCcError(ccResponse.status, errorText);
+      const fo = await creditFailover({
+        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        forward: async (key) => {
+          await ensureInitialized(key, abortController.signal);
+          return forwardToCC(ccBody, key, req.headers, abortController.signal);
+        },
+      });
+      route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
+      errorText = fo.errorText; mapped = fo.mapped;
+      if (!ccResponse.ok) {
+        outcome.state = isCreditExhaustedForAccount(route.accountId, ccResponse.status, mapped && mapped.code, errorText)
+          ? 'credit_exhausted'
+          : classifyUpstreamStatus(ccResponse.status);
+        outcome.status = ccResponse.status;
+        outcome.code = mapped.code || null;
+        outcome.message = (mapped.body && mapped.body.error && mapped.body.error.message) || null;
+        log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
+        sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
+        return;
+      }
     }
 
     // 下游断连检测：打断 CC 上游 + 记录日志
@@ -3854,7 +3983,7 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const route = resolveRoute(req.headers);
+  let route = resolveRoute(req.headers);
   if (route && route.error === 'no_available_account') {
     res.setHeader('Retry-After', '5');
     sendResponsesError(res, 503, 'no_available_account', 'No available upstream account for this token', 5);
@@ -3865,8 +3994,8 @@ async function handleResponses(req, res) {
       'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
     return;
   }
-  const apiKey = route.upstreamKey;
-  const outcome = { state: 'pending', ttftMs: null, status: null, code: null };
+  let apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
 
   let chatReq = convertResponsesToChat(respReq);
   if (!chatReq.messages.length) {
@@ -3913,17 +4042,31 @@ async function handleResponses(req, res) {
 
   try {
     await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      const mapped = mapCcError(ccResponse.status, errorText);
-      outcome.state = classifyUpstreamStatus(ccResponse.status);
-      outcome.status = ccResponse.status;
-      outcome.code = mapped.code || null;
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
-      return;
+      let errorText = await ccResponse.text().catch(() => '');
+      let mapped = mapCcError(ccResponse.status, errorText);
+      const fo = await creditFailover({
+        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        forward: async (key) => {
+          await ensureInitialized(key, abortController.signal);
+          return forwardToCC(ccBody, key, req.headers, abortController.signal, promptCacheKey);
+        },
+      });
+      route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
+      errorText = fo.errorText; mapped = fo.mapped;
+      if (!ccResponse.ok) {
+        outcome.state = isCreditExhaustedForAccount(route.accountId, ccResponse.status, mapped && mapped.code, errorText)
+          ? 'credit_exhausted'
+          : classifyUpstreamStatus(ccResponse.status);
+        outcome.status = ccResponse.status;
+        outcome.code = mapped.code || null;
+        outcome.message = (mapped.body && mapped.body.error && mapped.body.error.message) || null;
+        log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
+        sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
+        return;
+      }
     }
 
     if (stream) {
@@ -4428,6 +4571,15 @@ async function getAccountUsage(account, force) {
   try {
     const data = await fetchAccountUsage(account);
     view = { id: account.id, name: account.name, enabled: account.enabled, ...data };
+    // 额度查询确认余额已恢复（已用比例低于阈值）→ 立即解除额度耗尽冷却，不必等冷却到期
+    const p = view.credits && view.credits.usagePercent;
+    if (typeof p === 'number' && p < STORE.routing.creditUsageThreshold) {
+      const rt = getRuntime(account.id);
+      if (rt.creditExhausted) {
+        rt.creditExhausted = false; rt.cooldownUntil = 0; rt.cooldownLevel = 0; rt.consecutiveFailures = 0;
+        log('info', 'Account credit cooldown cleared by usage check', { account: account.name });
+      }
+    }
   } catch (e) {
     const status = e && e.status;
     view = {
@@ -4801,6 +4953,7 @@ function accountCard(a,m){
   addRow(rows,'在途',String(m?m.inFlight:0));
   addRow(rows,'评分',(m&&m.score!==undefined)?m.score.toFixed(3):'—');
   addRow(rows,'冷却',(m&&m.cooling)?('剩余 '+fmtDur(m.cooldownUntil-Date.now())):'否');
+  if(m&&m.creditExhausted)addRow(rows,'额度','耗尽（已长冷却，充值后自动恢复）');
   c.appendChild(rows);
   if(m&&m.lastError){append(c,el('div','key','最后错误: '+(m.lastError.status||'')+' '+(m.lastError.code||m.lastError.message||'')));}
   var sw=el('label','switch');var cb=el('input');cb.type='checkbox';cb.checked=!!a.enabled;
@@ -4971,7 +5124,10 @@ function renderRouting(root){
   var pCb=fieldInput('冷却基数 cooldownBaseMs',R.cooldownBaseMs||30000,'number');
   var pCm=fieldInput('冷却上限 cooldownMaxMs',R.cooldownMaxMs||300000,'number');
   var pTh=fieldInput('连续失败阈值 failureCooldownThreshold',R.failureCooldownThreshold||3,'number');
-  [pSel.el,pWin.el,pAlpha.el,pPsr.el,pEwma.el,pFloor.el,pCeil.el,pUnk.el,pRef.el,pCb.el,pCm.el,pTh.el].forEach(function(x){g.appendChild(x);});
+  var pCc=fieldInput('额度耗尽冷却 creditCooldownMs',R.creditCooldownMs||3600000,'number');
+  var pCf=fieldInput('额度换号上限 creditFailoverMax',R.creditFailoverMax!==undefined?R.creditFailoverMax:3,'number');
+  var pCu=fieldInput('额度兜底阈值 creditUsageThreshold',R.creditUsageThreshold!==undefined?R.creditUsageThreshold:0.95,'number');
+  [pSel.el,pWin.el,pAlpha.el,pPsr.el,pEwma.el,pFloor.el,pCeil.el,pUnk.el,pRef.el,pCb.el,pCm.el,pTh.el,pCc.el,pCf.el,pCu.el].forEach(function(x){g.appendChild(x);});
   append(card,g);
   append(card,el('h3',null,'策略预览（按当前滑杆值实时计算）'));
   var prevBox=el('div');append(card,prevBox);
@@ -4991,6 +5147,9 @@ function renderRouting(root){
       cooldownBaseMs:Number(pCb.inp.value),
       cooldownMaxMs:Number(pCm.inp.value),
       failureCooldownThreshold:Number(pTh.inp.value),
+      creditCooldownMs:Number(pCc.inp.value),
+      creditFailoverMax:Number(pCf.inp.value),
+      creditUsageThreshold:Number(pCu.inp.value),
       weights:{successRate:Number(sS.inp.value)/100,latency:Number(sL.inp.value)/100,load:Number(sC.inp.value)/100}
     };
     api('/admin/api/routing',{method:'PUT',body:body}).then(function(){toast('路由配置已更新','ok');refresh();})
@@ -5428,6 +5587,7 @@ async function handleAdmin(req, res, url) {
           consecutiveFailures: r.consecutiveFailures,
           cooldownUntil: r.cooldownUntil,
           cooling: r.cooldownUntil > now,
+          creditExhausted: !!r.creditExhausted,
           ewmaTtftMs: r.ewmaTtftMs,
           lastLatencyMs: r.lastLatencyMs,
           lastError: r.lastError,
