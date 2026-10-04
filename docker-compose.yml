@@ -7,6 +7,13 @@ services:
       - "${PROXY_PORT:-3050}:3050"
     environment:
       PORT: "3050"
+      # 管理后台令牌（强烈建议改成一个强随机值；留空 = 关闭 /admin）
+      CC_ADMIN_TOKEN: "${CC_ADMIN_TOKEN:-}"
+      # 账号池数据文件放在挂载卷里，容器重建不丢
+      CC_ACCOUNTS_FILE: "/app/data/accounts.json"
+    volumes:
+      # 挂目录而非单文件（挂单文件时宿主机不存在会被 Docker 建成同名目录）
+      - ./data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]

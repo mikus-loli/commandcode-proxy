@@ -8,7 +8,7 @@ import tls from 'tls';
 import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync, renameSync, chmodSync, unlinkSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -32,6 +32,8 @@ function loadConfig() {
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    adminToken: '',               // 管理后台令牌（空 = 后台关闭）。强烈建议用 CC_ADMIN_TOKEN 环境变量传入
+    accountsFile: 'accounts.json',// 账号池数据文件（相对 __dirname 或绝对路径）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -58,11 +60,469 @@ function loadConfig() {
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+  if (process.env.CC_ADMIN_TOKEN !== undefined) defaults.adminToken = process.env.CC_ADMIN_TOKEN;
+  if (process.env.CC_ACCOUNTS_FILE) defaults.accountsFile = process.env.CC_ACCOUNTS_FILE;
 
   return defaults;
 }
 
 const CFG = loadConfig();
+
+// ══════════════════════════════════════════════════════════════
+// 多账号池 + 智能路由（详见 README「多账号与智能路由」）
+// ══════════════════════════════════════════════════════════════
+const ACCOUNTS_PATH = resolve(__dirname, CFG.accountsFile);
+const CLIENT_TOKEN_PREFIX = 'ccp_';
+const MAX_ACCOUNTS = 100;
+const MAX_CLIENTS = 500;
+// 客户端令牌禁止匹配 legacy 的 user_ 正则，否则会与直通路径冲突（见 resolveRoute）。
+const USER_KEY_RE = /user_[a-zA-Z0-9_-]+/;
+
+function defaultRouting() {
+  return {
+    strategy: 'weighted',
+    selection: 'weighted_random',           // weighted_random | best
+    weights: { successRate: 0.5, latency: 0.3, load: 0.2 },
+    windowSizeMs: 300000,                   // 成功率滚动窗口 5min
+    bucketMs: 30000,                        // 窗口分桶粒度（内存 O(1)）
+    priorAlpha: 5,                          // Beta 先验强度（冷启动）
+    priorSuccessRate: 0.8,                  // 冷启动先验成功率
+    latencyEwmaAlpha: 0.3,                  // 成功样本 TTFT 的 EWMA 系数
+    latencyFloorMs: 400,
+    latencyCeilMs: 60000,
+    unknownLatencyScore: 0.5,               // 无延迟样本时的中性分
+    loadReference: 4,                       // 无 maxInflight 时 load=1/(1+inFlight/ref)
+    cooldownBaseMs: 30000,
+    cooldownMaxMs: 300000,
+    failureCooldownThreshold: 3,            // 连续失败 N 次进入冷却
+    countTimeoutsAsFailure: true,
+    countRateLimitAsFailure: true,
+    penalizeAuthErrors: false,              // 401/403 是否计入失败
+  };
+}
+
+function newStore() {
+  return { version: 1, accounts: [], clients: [], routing: defaultRouting() };
+}
+
+let STORE = newStore();
+let PERSISTENCE_OK = true;
+
+// ── 工具：ID / 令牌 / 掩码 / 定时安全比较 ──────────────
+function newId(prefix) { return prefix + crypto.randomBytes(6).toString('hex'); }
+function newClientToken() { return CLIENT_TOKEN_PREFIX + crypto.randomBytes(24).toString('hex'); }
+
+// 长度不等时也执行一次比较，避免长度侧信道。
+function timingSafeEqualStr(a, b) {
+  const ba = Buffer.from(String(a ?? ''), 'utf8');
+  const bb = Buffer.from(String(b ?? ''), 'utf8');
+  if (ba.length !== bb.length) { crypto.timingSafeEqual(ba, ba); return false; }
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// 密钥掩码：任何对外响应都必须经过它（账号 key 永不提供明文出口）。
+function maskKey(k) {
+  const s = String(k ?? '');
+  if (!s) return '';
+  if (s.length <= 12) return s.slice(0, 3) + '…';
+  return s.slice(0, 8) + '…' + s.slice(-4);
+}
+
+function clampNum(v, dflt, min, max) {
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+function sanitizeName(v, fallback) {
+  const s = String(v ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64);
+  return s || fallback;
+}
+
+// ── 校验与归一化 ────────────────────────────────────────
+function normalizeRouting(raw) {
+  const d = defaultRouting();
+  const r = { ...d, weights: { ...d.weights } };
+  if (!raw || typeof raw !== 'object') return r;
+  if (raw.selection === 'best' || raw.selection === 'weighted_random') r.selection = raw.selection;
+  if (raw.weights && typeof raw.weights === 'object') {
+    r.weights.successRate = clampNum(raw.weights.successRate, d.weights.successRate, 0, 1000);
+    r.weights.latency = clampNum(raw.weights.latency, d.weights.latency, 0, 1000);
+    r.weights.load = clampNum(raw.weights.load, d.weights.load, 0, 1000);
+  }
+  r.windowSizeMs = clampNum(raw.windowSizeMs, d.windowSizeMs, 10000, 86400000);
+  r.bucketMs = clampNum(raw.bucketMs, d.bucketMs, 1000, r.windowSizeMs);
+  r.priorAlpha = clampNum(raw.priorAlpha, d.priorAlpha, 0, 1000);
+  r.priorSuccessRate = clampNum(raw.priorSuccessRate, d.priorSuccessRate, 0, 1);
+  r.latencyEwmaAlpha = clampNum(raw.latencyEwmaAlpha, d.latencyEwmaAlpha, 0.01, 1);
+  r.latencyFloorMs = clampNum(raw.latencyFloorMs, d.latencyFloorMs, 1, 3600000);
+  r.latencyCeilMs = clampNum(raw.latencyCeilMs, d.latencyCeilMs, r.latencyFloorMs + 1, 3600000);
+  r.unknownLatencyScore = clampNum(raw.unknownLatencyScore, d.unknownLatencyScore, 0, 1);
+  r.loadReference = clampNum(raw.loadReference, d.loadReference, 0.1, 10000);
+  r.cooldownBaseMs = clampNum(raw.cooldownBaseMs, d.cooldownBaseMs, 1000, 3600000);
+  r.cooldownMaxMs = clampNum(raw.cooldownMaxMs, d.cooldownMaxMs, r.cooldownBaseMs, 86400000);
+  r.failureCooldownThreshold = clampNum(raw.failureCooldownThreshold, d.failureCooldownThreshold, 1, 1000);
+  r.countTimeoutsAsFailure = raw.countTimeoutsAsFailure !== false;
+  r.countRateLimitAsFailure = raw.countRateLimitAsFailure !== false;
+  r.penalizeAuthErrors = raw.penalizeAuthErrors === true;
+  return r;
+}
+
+// 字段级 merge 后**原地赋值**，避免在途请求读到半初始化对象。
+function applyRouting(raw) {
+  const next = normalizeRouting(raw);
+  for (const k of Object.keys(next)) {
+    if (k === 'weights') Object.assign(STORE.routing.weights, next.weights);
+    else STORE.routing[k] = next[k];
+  }
+  return STORE.routing;
+}
+
+function normalizeAccount(a) {
+  const nowIso = new Date().toISOString();
+  return {
+    id: typeof a.id === 'string' && a.id ? a.id : newId('acc_'),
+    name: sanitizeName(a.name, 'account'),
+    apiKey: String(a.apiKey),
+    enabled: a.enabled !== false,
+    weight: clampNum(a.weight, 1, 0.01, 1000),
+    priority: Number.isFinite(a.priority) ? a.priority : 0,
+    maxInflight: Number.isFinite(a.maxInflight) && a.maxInflight > 0 ? Math.floor(a.maxInflight) : 0,
+    tags: Array.isArray(a.tags) ? a.tags.filter(t => typeof t === 'string').slice(0, 20) : [],
+    notes: typeof a.notes === 'string' ? a.notes.slice(0, 2000) : '',
+    createdAt: a.createdAt || nowIso,
+    updatedAt: a.updatedAt || a.createdAt || nowIso,
+  };
+}
+
+function normalizeClient(c) {
+  const nowIso = new Date().toISOString();
+  return {
+    id: typeof c.id === 'string' && c.id ? c.id : newId('cli_'),
+    name: sanitizeName(c.name, 'client'),
+    token: typeof c.token === 'string' && c.token ? c.token : newClientToken(),
+    enabled: c.enabled !== false,
+    accountIds: Array.isArray(c.accountIds) ? c.accountIds.filter(x => typeof x === 'string') : null,
+    notes: typeof c.notes === 'string' ? c.notes.slice(0, 2000) : '',
+    createdAt: c.createdAt || nowIso,
+    updatedAt: c.updatedAt || c.createdAt || nowIso,
+    lastUsedAt: c.lastUsedAt || null,
+  };
+}
+
+function normalizeStore(raw) {
+  const base = newStore();
+  if (!raw || typeof raw !== 'object') return base;
+  if (Array.isArray(raw.accounts)) {
+    base.accounts = raw.accounts
+      .filter(a => a && typeof a === 'object' && typeof a.apiKey === 'string' && a.apiKey)
+      .slice(0, MAX_ACCOUNTS).map(normalizeAccount);
+  }
+  if (Array.isArray(raw.clients)) {
+    base.clients = raw.clients
+      .filter(c => c && typeof c === 'object' && typeof c.token === 'string' && c.token)
+      .slice(0, MAX_CLIENTS).map(normalizeClient);
+  }
+  if (raw.routing && typeof raw.routing === 'object') base.routing = normalizeRouting(raw.routing);
+  return base;
+}
+
+// ── 持久化：原子写 + 0600 ───────────────────────────────
+function persistAccounts() {
+  const tmp = ACCOUNTS_PATH + '.tmp-' + crypto.randomBytes(4).toString('hex');
+  try {
+    const dir = dirname(ACCOUNTS_PATH);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(tmp, JSON.stringify(STORE, null, 2), { mode: 0o600 });
+    renameSync(tmp, ACCOUNTS_PATH);
+    try { chmodSync(ACCOUNTS_PATH, 0o600); } catch {}
+    PERSISTENCE_OK = true;
+    return true;
+  } catch (e) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+    if (PERSISTENCE_OK) log('error', 'Failed to persist accounts file (memory-only mode)', { error: e.message, file: CFG.accountsFile });
+    PERSISTENCE_OK = false;
+    return false;
+  }
+}
+
+function loadAccountsFile() {
+  if (!existsSync(ACCOUNTS_PATH)) {
+    STORE = newStore();
+    persistAccounts();   // 首次生成；失败仅告警（内存态仍可用）
+    return;
+  }
+  try {
+    STORE = normalizeStore(JSON.parse(readFileSync(ACCOUNTS_PATH, 'utf-8')));
+    log('info', 'Accounts loaded', { accounts: STORE.accounts.length, clients: STORE.clients.length, file: CFG.accountsFile });
+  } catch (e) {
+    STORE = newStore();
+    log('error', 'Failed to parse accounts file, starting with empty pool', { error: e.message, file: CFG.accountsFile });
+  }
+}
+loadAccountsFile();
+
+// ── 运行时指标（不落盘） ────────────────────────────────
+const runtime = new Map(); // accountId → metrics
+
+function newRuntime() {
+  return {
+    inFlight: 0,
+    totals: { requests: 0, ok: 0, fail: 0, neutral: 0, retried: 0 },
+    buckets: [],
+    consecutiveFailures: 0,
+    cooldownUntil: 0,
+    cooldownLevel: 0,
+    lastError: null,
+    ewmaTtftMs: 0,
+    lastLatencyMs: 0,
+    lastUsedAt: 0,
+  };
+}
+function getRuntime(id) {
+  let r = runtime.get(id);
+  if (!r) { r = newRuntime(); runtime.set(id, r); }
+  return r;
+}
+function pruneRuntime() {
+  const ids = new Set(STORE.accounts.map(a => a.id));
+  for (const id of runtime.keys()) if (!ids.has(id)) runtime.delete(id);
+}
+function resetRuntime(id) { runtime.set(id, newRuntime()); }
+
+function pruneBuckets(r, now, routing) {
+  const cutoff = now - routing.windowSizeMs;
+  while (r.buckets.length && r.buckets[0].t < cutoff) r.buckets.shift();
+  // 极端情况下（长时间无请求）窗口内可能堆积很多桶，硬性封顶
+  const maxBuckets = Math.ceil(routing.windowSizeMs / routing.bucketMs) + 2;
+  while (r.buckets.length > maxBuckets) r.buckets.shift();
+}
+function addSample(r, now, routing, kind, ttftMs) {
+  const t = Math.floor(now / routing.bucketMs) * routing.bucketMs;
+  let b = r.buckets.length ? r.buckets[r.buckets.length - 1] : null;
+  if (!b || b.t !== t) { b = { t, ok: 0, fail: 0, ttftSum: 0, ttftCount: 0 }; r.buckets.push(b); }
+  if (kind === 'ok') {
+    b.ok++;
+    if (Number.isFinite(ttftMs)) { b.ttftSum += ttftMs; b.ttftCount++; }
+  } else {
+    b.fail++;
+  }
+  pruneBuckets(r, now, routing);
+}
+function windowStats(r, now, routing) {
+  pruneBuckets(r, now, routing);
+  let ok = 0, fail = 0, ttftSum = 0, ttftCount = 0;
+  for (const b of r.buckets) { ok += b.ok; fail += b.fail; ttftSum += b.ttftSum; ttftCount += b.ttftCount; }
+  return { ok, fail, n: ok + fail, ttftSum, ttftCount };
+}
+
+// ── 评分与选择 ──────────────────────────────────────────
+function scoreAccount(account, r, now, routing, maxWeight) {
+  const st = windowStats(r, now, routing);
+  const S = routing.priorAlpha > 0
+    ? (st.ok + routing.priorAlpha * routing.priorSuccessRate) / (st.n + routing.priorAlpha)
+    : (st.n > 0 ? st.ok / st.n : routing.priorSuccessRate);
+  let L;
+  if (r.ewmaTtftMs > 0) {
+    L = Math.min(1, Math.max(0, (routing.latencyCeilMs - r.ewmaTtftMs) / (routing.latencyCeilMs - routing.latencyFloorMs)));
+  } else {
+    L = routing.unknownLatencyScore;
+  }
+  const C = account.maxInflight > 0
+    ? Math.min(1, Math.max(0, 1 - r.inFlight / account.maxInflight))
+    : 1 / (1 + r.inFlight / routing.loadReference);
+
+  const wsum = routing.weights.successRate + routing.weights.latency + routing.weights.load;
+  const wS = wsum > 0 ? routing.weights.successRate / wsum : 1 / 3;
+  const wL = wsum > 0 ? routing.weights.latency / wsum : 1 / 3;
+  const wC = wsum > 0 ? routing.weights.load / wsum : 1 / 3;
+  const base = wS * S + wL * L + wC * C;
+  const weightFactor = maxWeight > 0 ? account.weight / maxWeight : 1;
+  const score = r.cooldownUntil > now ? 0 : base * weightFactor;
+  return {
+    score,
+    components: {
+      success: S, latency: L, load: C, weightFactor, base,
+      samples: st.n, ok: st.ok, fail: st.fail,
+      cooldownUntil: r.cooldownUntil, ewmaTtftMs: r.ewmaTtftMs, inFlight: r.inFlight,
+    },
+  };
+}
+
+function compareCandidates(a, b) {
+  if (b.score !== a.score) return b.score - a.score;
+  if (a.runtime.inFlight !== b.runtime.inFlight) return a.runtime.inFlight - b.runtime.inFlight;
+  const la = a.runtime.ewmaTtftMs || Infinity, lb = b.runtime.ewmaTtftMs || Infinity;
+  if (la !== lb) return la - lb;
+  if (a.runtime.lastUsedAt !== b.runtime.lastUsedAt) return a.runtime.lastUsedAt - b.runtime.lastUsedAt;
+  return a.account.id < b.account.id ? -1 : 1;
+}
+
+function selectAccount(client) {
+  const now = Date.now();
+  const routing = STORE.routing;
+  let list = STORE.accounts.filter(a => a.enabled);
+  if (client && Array.isArray(client.accountIds)) {
+    const allow = new Set(client.accountIds);
+    list = list.filter(a => allow.has(a.id));
+  }
+  const notSaturated = list.filter(a => {
+    const r = getRuntime(a.id);
+    return !(a.maxInflight > 0 && r.inFlight >= a.maxInflight);
+  });
+  const healthy = notSaturated.filter(a => getRuntime(a.id).cooldownUntil <= now);
+  const cooling = notSaturated.filter(a => getRuntime(a.id).cooldownUntil > now);
+
+  let pool = healthy;
+  let fallback = false;
+  if (pool.length === 0) {
+    if (cooling.length === 0) return null;   // 无可用账号
+    // fail-open：全在冷却时选冷却最早到期的那个，绝不因此 503
+    pool = cooling.slice().sort((a, b) => getRuntime(a.id).cooldownUntil - getRuntime(b.id).cooldownUntil);
+    fallback = true;
+  }
+
+  const maxWeight = pool.reduce((m, a) => Math.max(m, a.weight), 0);
+  const candidates = pool.map(a => {
+    const r = getRuntime(a.id);
+    const { score, components } = scoreAccount(a, r, now, routing, maxWeight);
+    const eff = fallback ? components.base * components.weightFactor : score;
+    return { account: a, score: eff, components, runtime: r };
+  });
+
+  if (routing.selection === 'best' || fallback) {
+    candidates.sort(compareCandidates);
+    return candidates[0].account;
+  }
+  const total = candidates.reduce((s, x) => s + x.score, 0);
+  if (!(total > 0)) { candidates.sort(compareCandidates); return candidates[0].account; }
+  let pick = Math.random() * total;
+  for (const x of candidates) { pick -= x.score; if (pick <= 0) return x.account; }
+  return candidates[candidates.length - 1].account;
+}
+
+function reserveAccount(accountId) {
+  const r = getRuntime(accountId);
+  r.inFlight++;
+  r.totals.requests++;
+  r.lastUsedAt = Date.now();
+}
+function releaseInflight(accountId) {
+  const r = getRuntime(accountId);
+  if (r.inFlight > 0) r.inFlight--;
+}
+
+// 上游状态码 → 记账口径：'fail' | 'neutral'
+function classifyUpstreamStatus(status) {
+  if (status === 400 || status === 404 || status === 422) return 'neutral'; // 客户端请求错，换账号一样
+  if (status === 401 || status === 403) return STORE.routing.penalizeAuthErrors ? 'fail' : 'neutral';
+  return 'fail';
+}
+
+function releaseAccount(accountId, outcome, latencyMs) {
+  const r = getRuntime(accountId);
+  if (r.inFlight > 0) r.inFlight--;
+  const now = Date.now();
+  const routing = STORE.routing;
+  const state = outcome && outcome.state;
+  if (outcome && outcome.status != null) {
+    r.lastError = { at: now, status: outcome.status, code: outcome.code || null, message: outcome.message || null };
+  }
+  if (latencyMs != null) r.lastLatencyMs = latencyMs;
+
+  if (state === 'ok') {
+    addSample(r, now, routing, 'ok', outcome.ttftMs);
+    if (Number.isFinite(outcome.ttftMs)) {
+      r.ewmaTtftMs = r.ewmaTtftMs > 0
+        ? routing.latencyEwmaAlpha * outcome.ttftMs + (1 - routing.latencyEwmaAlpha) * r.ewmaTtftMs
+        : outcome.ttftMs;
+    }
+    r.totals.ok++;
+    if (outcome.retried) r.totals.retried++;
+    r.consecutiveFailures = 0;
+    r.cooldownLevel = 0;
+    r.cooldownUntil = 0;
+  } else if (state === 'fail') {
+    addSample(r, now, routing, 'fail', null);
+    r.totals.fail++;
+    r.consecutiveFailures++;
+    if (r.consecutiveFailures >= routing.failureCooldownThreshold) {
+      const backoff = Math.min(routing.cooldownBaseMs * Math.pow(2, r.cooldownLevel), routing.cooldownMaxMs);
+      r.cooldownUntil = now + backoff;
+      r.cooldownLevel++;
+    }
+  } else if (state === 'neutral') {
+    r.totals.neutral++;
+  }
+  // aborted / pending：仅释放 inFlight，不记成败
+}
+
+// ── 凭据解析（池 / legacy 直通） ────────────────────────
+function rawCredential(headers) {
+  const auth = headers['authorization'] || headers['Authorization'] || '';
+  if (typeof auth === 'string') {
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    if (m) return m[1].trim();
+  }
+  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
+  if (typeof xKey === 'string' && xKey) return xKey.trim();
+  return '';
+}
+
+function findClientByToken(raw) {
+  if (!raw) return null;
+  for (const c of STORE.clients) {
+    if (c.enabled && timingSafeEqualStr(c.token, raw)) return c;
+  }
+  return null;
+}
+
+/**
+ * 解析请求凭据。返回：
+ *  - null                       → 无凭据（调用方按现有 401 处理）
+ *  - { error:'no_available_account' } → 令牌有效但无可用账号（503）
+ *  - { mode:'pool',  upstreamKey, accountId, clientId, release(outcome,latencyMs) }
+ *  - { mode:'legacy', upstreamKey, release: no-op }
+ */
+function resolveRoute(headers) {
+  const raw = rawCredential(headers);
+  if (!raw) return null;
+
+  // 池模式必须排在 legacy 之前（user_ 直通是兜底）
+  const client = findClientByToken(raw);
+  if (client) {
+    const account = selectAccount(client);
+    if (!account) return { error: 'no_available_account' };
+    reserveAccount(account.id);
+    client.lastUsedAt = Date.now();
+    let released = false;
+    return {
+      mode: 'pool',
+      clientId: client.id,
+      accountId: account.id,
+      upstreamKey: account.apiKey,
+      release: (outcome, latencyMs) => {
+        if (released) return;
+        released = true;
+        releaseAccount(account.id, outcome, latencyMs);
+      },
+    };
+  }
+
+  // legacy 直通：保留 getApiKey 的子串语义，与改造前逐字一致
+  const legacyKey = getApiKey(headers);
+  if (legacyKey) return { mode: 'legacy', upstreamKey: legacyKey, release: () => {} };
+  return null;
+}
+
+// /v1/models 用的轻量选择：不记账，仅占用/释放在途
+function selectForModels() {
+  const account = selectAccount(null);
+  if (!account) return null;
+  const r = getRuntime(account.id);
+  r.inFlight++;
+  r.lastUsedAt = Date.now();
+  return { mode: 'pool', accountId: account.id, upstreamKey: account.apiKey, release: () => releaseInflight(account.id) };
+}
 
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -1356,11 +1816,21 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const route = resolveRoute(req.headers);
+  if (route && route.error === 'no_available_account') {
+    res.setHeader('Retry-After', '5');
+    sendJSON(res, 503, { error: { message: 'No available upstream account for this token', type: 'no_available_account' }, retry_after: 5 });
+    return;
+  }
+  if (!route) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
+  const apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null };
+  const startTime = Date.now();
+  const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
+  try {
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
@@ -1375,7 +1845,6 @@ async function handleChatCompletions(req, res) {
   let abortController = new AbortController();
   let aborted = false;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
-  const startTime = Date.now();
   let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
   let reader = null;
   let translator = null;
@@ -1424,6 +1893,9 @@ async function handleChatCompletions(req, res) {
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
+      outcome.state = classifyUpstreamStatus(ccResponse.status);
+      outcome.status = ccResponse.status;
+      outcome.code = mapped.code || null;
       log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendJSON(res, mapped.status, mapped.body);
       return;
@@ -1433,6 +1905,7 @@ async function handleChatCompletions(req, res) {
     if (attempt === 1) res.on('close', () => {
       if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
+      if (outcome.state === 'pending') outcome.state = 'aborted';
       const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
         : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
         : 'client-hangup';
@@ -1481,6 +1954,7 @@ async function handleChatCompletions(req, res) {
           if (done) break;
           if (aborted) break;
           bytesReceived += value.length;
+          markTtft();
 
           const chunkText = decoder.decode(value, { stream: true });
           buffer += chunkText;
@@ -1531,6 +2005,8 @@ async function handleChatCompletions(req, res) {
             }
           }
           if (translator.upstreamError) {
+            outcome.state = 'fail';
+            outcome.status = translator.upstreamError.status;
             if (!started) {
               sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
               return;
@@ -1551,11 +2027,15 @@ async function handleChatCompletions(req, res) {
             }
             log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: detail });
             const err = incompleteUpstreamError(detail);
+            outcome.state = 'fail';
+            outcome.status = err.status;
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) { sendJSON(res, err.status, err.body); return; }
             try { res.write(`data: ${JSON.stringify(err.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
+            outcome.state = 'fail';
+            outcome.status = 429;
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -1574,6 +2054,7 @@ async function handleChatCompletions(req, res) {
             }
             res.write(translator.getDoneEvent());
             delivered = true;
+            outcome.state = 'ok';
           }
         }
       } catch (e) {
@@ -1582,6 +2063,8 @@ async function handleChatCompletions(req, res) {
           // cancel() 返回 promise：不接住的话，连接已被对端掐断时会抛 UnhandledPromiseRejection
           try { reader.cancel().catch(() => {}); } catch {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          outcome.state = 'fail';
+          outcome.status = 429;
           log('warn', 'Stream idle timeout', {
             path: '/v1/chat/completions',
             model,
@@ -1625,6 +2108,8 @@ async function handleChatCompletions(req, res) {
         } else {
           // 传输层错误不要覆盖已经解析到的语义错误：把「上游容量不足」说成「代理挂了」是误导
           if (translator?.upstreamError && !started) {
+            outcome.state = 'fail';
+            outcome.status = translator.upstreamError.status;
             log('warn', 'Upstream terminated after a parsed semantic error', { message: e.message });
             try { abortController.abort(); } catch {}
             sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
@@ -1632,6 +2117,8 @@ async function handleChatCompletions(req, res) {
           }
           log('error', 'Stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
+          outcome.state = 'fail';
+          outcome.status = 502;
           if (!started) {
             sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
             return;
@@ -1725,6 +2212,7 @@ async function handleChatCompletions(req, res) {
           const { done, value } = result;
           if (done) break;
           bytesReceived += value.length;
+          markTtft();
           const chunkText = decoder.decode(value, { stream: true });
           buf += chunkText;
           // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
@@ -1736,6 +2224,8 @@ async function handleChatCompletions(req, res) {
       processLines();
 
       if (upstreamError) {
+        outcome.state = 'fail';
+        outcome.status = upstreamError.status;
         sendJSON(res, upstreamError.status, upstreamError.body);
         return;
       }
@@ -1750,6 +2240,8 @@ async function handleChatCompletions(req, res) {
         }
         log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: incomplete });
         const err = incompleteUpstreamError(incomplete);
+        outcome.state = 'fail';
+        outcome.status = err.status;
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendJSON(res, err.status, err.body);
         return;
@@ -1757,6 +2249,8 @@ async function handleChatCompletions(req, res) {
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
+        outcome.state = 'fail';
+        outcome.status = 429;
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
         return;
@@ -1789,6 +2283,7 @@ async function handleChatCompletions(req, res) {
     })(),
       });
       delivered = true;
+      outcome.state = 'ok';
     }
     // 只有本次尝试真的交付了正常响应才算「重试救回来了」；
     // 已向下游报错的尝试（502/429）不能记成 recovered
@@ -1801,6 +2296,7 @@ async function handleChatCompletions(req, res) {
     break attemptLoop;   // 本次尝试已完整处理（成功或已按语义返回错误）
   } catch (e) {
     if (abortController.signal.aborted) {
+      if (outcome.state === 'pending') outcome.state = 'aborted';
       log('warn', 'Request cancelled (client disconnected before CC response)', {
         path: '/v1/chat/completions',
         model,
@@ -1808,6 +2304,8 @@ async function handleChatCompletions(req, res) {
       });
       return; // 下游已断连：不再重试（res 已关闭）
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      outcome.state = 'fail';
+      outcome.status = 429;
       log('warn', 'Stream idle timeout', {
         path: '/v1/chat/completions',
         model,
@@ -1841,6 +2339,8 @@ async function handleChatCompletions(req, res) {
       // 传输层错误不要覆盖已经解析到的语义错误：把「上游容量不足」说成「代理挂了」是误导
       const semantic = upstreamError || translator?.upstreamError;
       if (semantic && !res.headersSent) {
+        outcome.state = 'fail';
+        outcome.status = semantic.status;
         log('warn', 'Upstream terminated after a parsed semantic error', { message: e.message });
         try { abortController.abort(); } catch {}
         sendJSON(res, semantic.status, semantic.body);
@@ -1848,11 +2348,16 @@ async function handleChatCompletions(req, res) {
       }
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
+      outcome.state = 'fail';
+      outcome.status = 502;
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
       return;
     }
   }
   }   // ← end of attemptLoop
+  } finally {
+    route.release(outcome, Date.now() - startTime);
+  }
 }
 
 // ── Anthropic /v1/messages 协议转换 ─────────────────
@@ -2365,11 +2870,18 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const route = resolveRoute(req.headers);
+  if (route && route.error === 'no_available_account') {
+    res.setHeader('Retry-After', '5');
+    sendJSON(res, 503, { type: 'error', error: { type: 'no_available_account', message: 'No available upstream account for this token' }, retry_after: 5 });
+    return;
+  }
+  if (!route) {
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
+  const apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null };
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
@@ -2382,6 +2894,7 @@ async function handleMessages(req, res) {
   let aborted = false;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
+  const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   let messageId = '';
   let reader = null;
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
@@ -2394,6 +2907,9 @@ async function handleMessages(req, res) {
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
+      outcome.state = classifyUpstreamStatus(ccResponse.status);
+      outcome.status = ccResponse.status;
+      outcome.code = mapped.code || null;
       log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
@@ -2403,6 +2919,7 @@ async function handleMessages(req, res) {
     res.on('close', () => {
       if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
+      if (outcome.state === 'pending') outcome.state = 'aborted';
       if (!abortController.signal.aborted) {
         // 断连前抢发 usage=0 终止事件，避免下游自行估算 token
         try {
@@ -2467,6 +2984,7 @@ async function handleMessages(req, res) {
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
+          markTtft();
           if (!started && !event.startsWith('event: message_start')) {
             await flushBuf();
           }
@@ -2482,6 +3000,8 @@ async function handleMessages(req, res) {
         if (!aborted) {
           consecutiveTimeouts = 0;
           if (ctx.upstreamError) {
+            outcome.state = 'fail';
+            outcome.status = ctx.upstreamError.status;
             if (!started) {
               sendAnthropicError(
                 res,
@@ -2492,6 +3012,8 @@ async function handleMessages(req, res) {
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
           } else if (ctx.outputTokens === 0) {
+            outcome.state = 'fail';
+            outcome.status = 429;
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
@@ -2499,6 +3021,7 @@ async function handleMessages(req, res) {
             }
             await flushBuf();
           } else {
+            outcome.state = 'ok';
             await flushBuf();
           }
         }
@@ -2506,6 +3029,8 @@ async function handleMessages(req, res) {
         if (aborted) {
           // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          outcome.state = 'fail';
+          outcome.status = 429;
           log('warn', 'Stream idle timeout', {
             path: '/v1/messages',
             model,
@@ -2537,6 +3062,8 @@ async function handleMessages(req, res) {
             try { res.end(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
           }
         } else {
+          outcome.state = 'fail';
+          outcome.status = 502;
           log('error', 'Anthropic stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
@@ -2632,6 +3159,7 @@ async function handleMessages(req, res) {
         const { done, value } = result;
         if (done) break;
         bytesReceived += value.length;
+        markTtft();
         const chunkText = decoder.decode(value, { stream: true });
         buf += chunkText;
         // 无换行则不可能产生完整行，跳过全量 split
@@ -2641,6 +3169,8 @@ async function handleMessages(req, res) {
       processLines();
 
       if (upstreamError) {
+        outcome.state = 'fail';
+        outcome.status = upstreamError.status;
         sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
         return;
       }
@@ -2649,8 +3179,10 @@ async function handleMessages(req, res) {
       {
         const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
         if (incomplete) {
+          outcome.state = 'fail';
           log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
           const err = incompleteUpstreamError(incomplete);
+          outcome.status = err.status;
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
           sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
           return;
@@ -2660,12 +3192,15 @@ async function handleMessages(req, res) {
       // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
       // 会把有完整文本的响应误杀成 429
       if (!fullText && !thinkingText && !toolCalls) {
+        outcome.state = 'fail';
+        outcome.status = 429;
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
         return;
       }
 
       consecutiveTimeouts = 0;
+      outcome.state = 'ok';
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
   } catch (e) {
@@ -2676,6 +3211,8 @@ async function handleMessages(req, res) {
         messageId,
       });
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      outcome.state = 'fail';
+      outcome.status = 429;
       log('warn', 'Stream idle timeout', {
         path: '/v1/messages',
         model,
@@ -2696,10 +3233,14 @@ async function handleMessages(req, res) {
       res.setHeader('Retry-After', '5');
       sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
     } else {
+      outcome.state = 'fail';
+      outcome.status = 502;
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
     }
+  } finally {
+    route.release(outcome, Date.now() - startTime);
   }
 }
 
@@ -3312,12 +3853,19 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const route = resolveRoute(req.headers);
+  if (route && route.error === 'no_available_account') {
+    res.setHeader('Retry-After', '5');
+    sendResponsesError(res, 503, 'no_available_account', 'No available upstream account for this token', 5);
+    return;
+  }
+  if (!route) {
     sendResponsesError(res, 401, 'authentication_error',
       'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
     return;
   }
+  const apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null };
 
   let chatReq = convertResponsesToChat(respReq);
   if (!chatReq.messages.length) {
@@ -3345,6 +3893,7 @@ async function handleResponses(req, res) {
   const abortController = new AbortController();
   let aborted = false;
   const startTime = Date.now();
+  const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   let bytesReceived = 0;
   let lastCcEvent = '';
   let reader = null;
@@ -3353,6 +3902,7 @@ async function handleResponses(req, res) {
   res.on('close', () => {
     if (res.writableEnded) return;
     aborted = true;
+    if (outcome.state === 'pending') outcome.state = 'aborted';
     log('warn', 'Client disconnected', {
       path: '/v1/responses', model, responseId, elapsedMs: Date.now() - startTime,
       bytesSent: bytesReceived, lastCcEvent: lastCcEvent || '(none)',
@@ -3367,6 +3917,9 @@ async function handleResponses(req, res) {
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
+      outcome.state = classifyUpstreamStatus(ccResponse.status);
+      outcome.status = ccResponse.status;
+      outcome.code = mapped.code || null;
       log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
@@ -3417,6 +3970,7 @@ async function handleResponses(req, res) {
           if (done) break;
           if (aborted || res.destroyed) break;
           bytesReceived += value.length;
+          markTtft();
 
           const chunkText = decoder.decode(value, { stream: true });
           buffer += chunkText;
@@ -3439,6 +3993,8 @@ async function handleResponses(req, res) {
             if (evts) await writeEvents(evts);
           }
           if (translator.upstreamError) {
+            outcome.state = 'fail';
+            outcome.status = translator.upstreamError.status;
             if (!started) {
               sendResponsesError(res, translator.upstreamError.status,
                 translator.upstreamError.body.error.type, translator.upstreamError.body.error.message,
@@ -3448,11 +4004,14 @@ async function handleResponses(req, res) {
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
           } else if (translator.outputTokens === 0 && !translator.started) {
+            outcome.state = 'fail';
+            outcome.status = 429;
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
             sendResponsesError(res, 429, 'rate_limit_error',
               'Empty response from upstream (zero output tokens)', 10);
             return;
           } else {
+            outcome.state = 'ok';
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
             for (const e2 of translator.finish()) res.write(e2);
           }
@@ -3462,6 +4021,8 @@ async function handleResponses(req, res) {
         if (aborted) {
           try { reader.cancel().catch(() => {}); } catch (e2) {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          outcome.state = 'fail';
+          outcome.status = 429;
           log('warn', 'Stream idle timeout', {
             path: '/v1/responses', model, streaming: true, timeoutMs: STREAM_IDLE_TIMEOUT_MS,
             elapsedMs: Date.now() - startTime, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
@@ -3476,6 +4037,8 @@ async function handleResponses(req, res) {
             try { res.end(translator.errorEvent(timeoutMsg)); } catch (e2) {}
           }
         } else {
+          outcome.state = 'fail';
+          outcome.status = 502;
           log('error', 'Stream error', { message: e.message, path: '/v1/responses' });
           try { abortController.abort(); } catch (e2) {}
           if (!started) {
@@ -3571,6 +4134,7 @@ async function handleResponses(req, res) {
         const value = result.value;
         if (done) break;
         bytesReceived += value.length;
+        markTtft();
         const chunkText = decoder.decode(value, { stream: true });
         buf += chunkText;
         if (chunkText.indexOf('\n') !== -1) processLines();
@@ -3579,6 +4143,8 @@ async function handleResponses(req, res) {
       processLines();
 
       if (upstreamError) {
+        outcome.state = 'fail';
+        outcome.status = upstreamError.status;
         sendResponsesError(res, upstreamError.status, upstreamError.body.error.type,
           upstreamError.body.error.message, upstreamError.body.retry_after);
         return;
@@ -3588,8 +4154,10 @@ async function handleResponses(req, res) {
       {
         const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
         if (incomplete) {
+          outcome.state = 'fail';
           log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
           const err = incompleteUpstreamError(incomplete);
+          outcome.status = err.status;
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
           sendResponsesError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
           return;
@@ -3597,6 +4165,8 @@ async function handleResponses(req, res) {
       }
 
       if (!fullText && !thinkingText && !toolCalls.length) {
+        outcome.state = 'fail';
+        outcome.status = 429;
         try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
         sendResponsesError(res, 429, 'rate_limit_error',
           'Empty response from upstream (zero output tokens)', 10);
@@ -3604,12 +4174,14 @@ async function handleResponses(req, res) {
       }
 
       consecutiveTimeouts = 0;
+      outcome.state = 'ok';
       echoOpts.finishReason = finishReason;
       sendJSON(res, 200, buildResponsesObject(
         responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));
     }
   } catch (e) {
     if (e.name === 'AbortError' || e.code === 'ABORT_ERR') return;
+    if (outcome.state === 'pending') { outcome.state = 'fail'; outcome.status = 502; }
     log('error', 'Responses handler error', { message: e.message });
     if (!res.headersSent) {
       sendResponsesError(res, 502, 'proxy_error', 'Upstream error: ' + e.message, 10);
@@ -3617,22 +4189,42 @@ async function handleResponses(req, res) {
       try { res.write(translator ? translator.errorEvent(e.message) : ''); } catch (e2) {}
       try { res.end(); } catch (e2) {}
     }
+  } finally {
+    route.release(outcome, Date.now() - startTime);
   }
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
-  const now = nowUnix();
-  sendJSON(res, 200, {
-    object: 'list',
-    data: models.map(m => ({
-      id: m.id,
-      object: 'model',
-      created: now,
-      owned_by: 'command-code',
-    })),
-  });
+  // /v1/models 不计入成败指标，只按池模式借用一个账号（legacy 直通保持原样）
+  const raw = rawCredential(req.headers);
+  let apiKey = null;
+  let lease = null;
+  if (raw && findClientByToken(raw)) {
+    lease = selectForModels();
+    if (!lease) {
+      res.setHeader('Retry-After', '5');
+      sendJSON(res, 503, { error: { message: 'No available upstream account for this token', type: 'no_available_account' }, retry_after: 5 });
+      return;
+    }
+    apiKey = lease.upstreamKey;
+  } else {
+    apiKey = getApiKey(req.headers);
+  }
+  try {
+    const models = await fetchModels(apiKey);
+    const now = nowUnix();
+    sendJSON(res, 200, {
+      object: 'list',
+      data: models.map(m => ({
+        id: m.id,
+        object: 'model',
+        created: now,
+        owned_by: 'command-code',
+      })),
+    });
+  } finally {
+    if (lease) lease.release();
+  }
 }
 
 function handleHealth(req, res) {
@@ -3640,26 +4232,993 @@ function handleHealth(req, res) {
   res.end('OK');
 }
 
+// ══════════════════════════════════════════════════════════════
+// 管理 API（/admin 外壳 + /admin/api/*）
+// 安全约定：账号 key / client 令牌永不出明文；仅新建/轮换时一次性返回 client 明文令牌。
+// ══════════════════════════════════════════════════════════════
+const ADMIN_BODY_LIMIT = 1048576; // 管理请求体 1MB 上限
+const SERVER_STARTED_AT = Date.now();
+let ADMIN_DISABLED_WARNED = false;
+
+function adminEnabled() { return !!CFG.adminToken; }
+
+function checkAdminAuth(req) {
+  if (!adminEnabled()) return false;
+  const h = req.headers || {};
+  let token = h['x-admin-token'] || h['X-Admin-Token'] || '';
+  if (!token) {
+    const auth = h['authorization'] || h['Authorization'] || '';
+    if (typeof auth === 'string') {
+      const m = auth.match(/^Bearer\s+(.+)$/i);
+      if (m) token = m[1].trim();
+    }
+  }
+  if (typeof token !== 'string' || !token) return false;
+  return timingSafeEqualStr(CFG.adminToken, token);
+}
+
+function adminJSON(res, status, data) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(data));
+}
+
+function readAdminBody(req, limit = ADMIN_BODY_LIMIT) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let size = 0, done = false;
+    const chunks = [];
+    req.on('data', (c) => {
+      if (done) return;
+      size += c.length;
+      if (size > limit) {
+        done = true;
+        req.destroy();
+        rejectPromise(Object.assign(new Error('Payload too large'), { statusCode: 413 }));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (done) return;
+      done = true;
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) return resolvePromise({});
+      try { resolvePromise(JSON.parse(raw)); }
+      catch { rejectPromise(Object.assign(new Error('Invalid JSON body'), { statusCode: 400 })); }
+    });
+    req.on('error', (e) => { if (!done) { done = true; rejectPromise(e); } });
+  });
+}
+
+// 对外视图：apiKey 一律掩码
+function accountView(a) {
+  return {
+    id: a.id, name: a.name, apiKey: maskKey(a.apiKey),
+    enabled: a.enabled, weight: a.weight, priority: a.priority,
+    maxInflight: a.maxInflight, tags: a.tags, notes: a.notes,
+    createdAt: a.createdAt, updatedAt: a.updatedAt,
+  };
+}
+// 对外视图：token 一律掩码（明文仅新建/轮换时一次性返回）
+function clientView(c) {
+  return {
+    id: c.id, name: c.name, enabled: c.enabled, accountIds: c.accountIds,
+    notes: c.notes, token: maskKey(c.token),
+    createdAt: c.createdAt, updatedAt: c.updatedAt, lastUsedAt: c.lastUsedAt,
+  };
+}
+function findAccountIndex(id) { return STORE.accounts.findIndex(a => a.id === id); }
+function findClientIndex(id) { return STORE.clients.findIndex(c => c.id === id); }
+function persistWarning() { return PERSISTENCE_OK ? {} : { warning: 'persistence disabled' }; }
+
+// 校验 accountIds 白名单：null = 全部；数组则每个 id 必须存在
+function validateAccountIds(v) {
+  if (v === undefined || v === null) return { ok: true, value: null };
+  if (!Array.isArray(v)) return { ok: false, error: 'accountIds must be an array or null' };
+  const unknown = v.filter(x => findAccountIndex(String(x)) < 0);
+  if (unknown.length) return { ok: false, error: 'Unknown account id(s): ' + unknown.join(', ') };
+  return { ok: true, value: v.map(String) };
+}
+
+// 零机密 HTML 外壳：不需要令牌（令牌由前端弹框输入，仅存 sessionStorage）
+// 转义纪律：内嵌 JS 一律单引号拼接，禁止反引号与 ${；DOM 一律 textContent/createElement，严禁 innerHTML。
+function sendAdminShell(req, res) {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const html = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CC Proxy Admin</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;background:#0d1117;color:#c9d1d9;font-size:14px}
+header#bar{display:flex;align-items:center;gap:16px;padding:12px 20px;background:#161b22;border-bottom:1px solid #30363d;position:sticky;top:0;z-index:10;flex-wrap:wrap}
+.brand{font-weight:700;font-size:16px;color:#e6edf3}
+.muted{color:#8b949e}
+.stats{display:flex;gap:10px;flex-wrap:wrap;font-size:12px}
+.stat{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:4px 10px;white-space:nowrap}
+.stat b{color:#e6edf3;font-weight:600}
+.stat.bad{border-color:#da3633;color:#f85149}
+.spacer{flex:1}
+nav#tabs{display:flex;gap:8px;padding:12px 20px 0;flex-wrap:wrap}
+.tab{background:transparent;border:1px solid #30363d;color:#c9d1d9;padding:7px 16px;border-radius:6px 6px 0 0;cursor:pointer;font-size:13px}
+.tab.active{background:#161b22;border-bottom-color:#161b22;color:#58a6ff}
+main#view{padding:20px}
+.section-head{display:flex;align-items:center;gap:12px;margin:0 0 12px}
+.section-head h2{margin:0;font-size:17px;color:#e6edf3}
+.section-head .btn{margin-left:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-bottom:14px}
+.card.off{opacity:.6}
+.card.bad{border-color:#da3633}
+.card.warn{border-color:#d29922}
+.card.ok{border-color:#238636}
+.card h3{margin:0 0 6px;font-size:15px;color:#e6edf3;display:flex;align-items:center;gap:8px}
+.badge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid transparent}
+.b-green{background:rgba(35,134,54,.2);color:#3fb950;border-color:#238636}
+.b-yellow{background:rgba(210,153,34,.2);color:#d29922;border-color:#9e6a03}
+.b-red{background:rgba(218,54,51,.2);color:#f85149;border-color:#da3633}
+.b-gray{background:rgba(139,148,158,.15);color:#8b949e;border-color:#30363d}
+.key{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8b949e;word-break:break-all;margin:4px 0}
+.rows{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;margin:10px 0;font-size:12.5px}
+.rows .k{color:#8b949e}
+.rows .v{color:#e6edf3;text-align:right}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center}
+.btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12.5px}
+.btn:hover{background:#30363d}
+.btn.primary{background:#238636;border-color:#2ea043;color:#fff}
+.btn.primary:hover{background:#2ea043}
+.btn.danger{border-color:#da3633;color:#f85149}
+.btn.tiny{padding:3px 8px;font-size:11.5px}
+input[type=text],input[type=number],input[type=password],select,textarea{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:6px;padding:6px 8px;font-size:13px;width:100%}
+input[type=range]{width:100%;accent-color:#58a6ff}
+label.field{display:block;margin-bottom:10px}
+label.field>span{display:block;color:#8b949e;font-size:12px;margin-bottom:4px}
+label.field .muted{font-size:11.5px}
+.switch{display:flex;align-items:center;gap:8px;margin:6px 0}
+.switch input{width:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{border-bottom:1px solid #21262d;padding:7px 10px;text-align:left;vertical-align:middle}
+th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
+.bar{height:8px;background:#21262d;border-radius:4px;overflow:hidden;display:inline-block;width:70px;vertical-align:middle}
+.bar>i{display:block;height:100%;background:#3fb950}
+.overlay{position:fixed;inset:0;background:rgba(1,4,9,.75);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;width:480px;max-width:96vw;max-height:88vh;overflow:auto}
+.modal h2{margin:0 0 12px;font-size:16px;color:#e6edf3}
+.err{color:#f85149;font-size:12.5px;min-height:16px;margin:6px 0;word-break:break-word}
+.toast-wrap{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:60}
+.toast{background:#161b22;border:1px solid #30363d;border-left:3px solid #58a6ff;padding:10px 14px;border-radius:8px;font-size:13px;max-width:340px}
+.toast.ok{border-left-color:#3fb950}
+.toast.err{border-left-color:#f85149}
+.token-once{background:#0d1117;border:1px solid #d29922;border-radius:8px;padding:12px;margin-top:10px}
+.token-once code{display:block;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#e6edf3;word-break:break-all;margin:8px 0}
+#app[hidden]{display:none}
+</style>
+</head>
+<body>
+<div id="app" hidden>
+  <header id="bar">
+    <div class="brand">CC Proxy <span class="muted">Admin</span></div>
+    <div class="stats" id="stats"></div>
+    <div class="spacer"></div>
+    <button class="btn" id="logout">登出</button>
+  </header>
+  <nav id="tabs">
+    <button class="tab" data-tab="accounts">账号</button>
+    <button class="tab" data-tab="clients">客户端令牌</button>
+    <button class="tab" data-tab="routing">路由配置</button>
+    <button class="tab" data-tab="metrics">指标</button>
+  </nav>
+  <main id="view"></main>
+</div>
+<div class="toast-wrap" id="toasts"></div>
+<script nonce="${nonce}">
+(function(){
+'use strict';
+var TKEY='ccp_admin_token';
+var token=sessionStorage.getItem(TKEY)||'';
+var S={tab:'accounts',accounts:[],clients:[],routing:null,metrics:null,config:null};
+
+function byId(x){return document.getElementById(x);}
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined&&text!==null)e.textContent=String(text);return e;}
+function append(n){for(var i=1;i<arguments.length;i++){var c=arguments[i];if(c)n.appendChild(c);}return n;}
+function clear(n){while(n.firstChild)n.removeChild(n.firstChild);}
+function mkbtn(label,cls,fn){var b=el('button','btn'+(cls?(' '+cls):''),label);b.onclick=fn;return b;}
+function fmtDur(ms){ms=Number(ms)||0;var s=Math.floor(ms/1000);var d=Math.floor(s/86400);var h=Math.floor((s%86400)/3600);var m=Math.floor((s%3600)/60);var ss=s%60;if(d>0)return d+'d '+h+'h';if(h>0)return h+'h '+m+'m';if(m>0)return m+'m '+ss+'s';return ss+'s';}
+function pct(x){if(x===null||x===undefined||!isFinite(x))return '—';return (x*100).toFixed(1)+'%';}
+function msfmt(x){if(x===null||x===undefined||!isFinite(x)||x<=0)return '—';return Math.round(x)+'ms';}
+function fmtTime(v){if(!v)return '—';var d=new Date(v);if(isNaN(d.getTime()))return '—';return d.toLocaleString();}
+function toast(msg,kind){var t=el('div','toast '+(kind||''),msg);byId('toasts').appendChild(t);setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t);},3600);}
+
+function api(path,opts){
+  opts=opts||{};
+  var headers={};
+  if(opts.headers){for(var k in opts.headers)headers[k]=opts.headers[k];}
+  if(token)headers['x-admin-token']=token;
+  var body;
+  if(opts.body!==undefined){body=typeof opts.body==='string'?opts.body:JSON.stringify(opts.body);headers['Content-Type']='application/json';}
+  return fetch(path,{method:opts.method||'GET',headers:headers,body:body}).then(function(r){
+    if(r.status===401){token='';try{sessionStorage.removeItem(TKEY);}catch(e){}var er=new Error('unauthorized');er.auth=true;throw er;}
+    return r.text().then(function(txt){
+      var j={};try{j=txt?JSON.parse(txt):{};}catch(e){j={};}
+      if(!r.ok){var m=(j&&j.error&&j.error.message)||('HTTP '+r.status);var e2=new Error(m);e2.status=r.status;throw e2;}
+      return j;
+    });
+  });
+}
+function post(path,body){return api(path,{method:'POST',body:body});}
+function del(path){return api(path,{method:'DELETE'});}
+
+function refresh(){
+  if(!token){showAuth();return;}
+  return Promise.all([
+    api('/admin/api/accounts'),
+    api('/admin/api/clients'),
+    api('/admin/api/routing'),
+    api('/admin/api/metrics'),
+    api('/admin/api/config')
+  ]).then(function(res){
+    S.accounts=res[0].accounts||[];
+    S.clients=res[1].clients||[];
+    S.routing=res[2].routing||null;
+    S.metrics=res[3]||null;
+    S.config=res[4]||null;
+    render();
+  }).catch(function(e){
+    if(e&&e.auth){showAuth();return;}
+    toast('刷新失败：'+(e&&e.message?e.message:String(e)),'err');
+  });
+}
+
+function showAuth(){
+  if(byId('authbox'))return;
+  byId('app').hidden=true;
+  var ov=el('div','overlay');ov.id='authbox';
+  var box=el('div','modal');
+  append(box,el('h2',null,'管理后台登录'));
+  append(box,el('p','muted','请输入 Admin Token（对应 CC_ADMIN_TOKEN）。令牌仅存于本会话 sessionStorage，不会落盘。'));
+  var inp=el('input');inp.type='password';inp.placeholder='Admin Token';inp.value=token||'';
+  append(box,inp);
+  var err=el('div','err');
+  append(box,err);
+  var btn=mkbtn('连接','primary',function(){
+    var t=inp.value.trim();
+    if(!t){err.textContent='令牌不能为空';return;}
+    token=t;try{sessionStorage.setItem(TKEY,token);}catch(e){}
+    api('/admin/api/config').then(function(cfg){
+      S.config=cfg;
+      if(ov.parentNode)ov.parentNode.removeChild(ov);
+      byId('app').hidden=false;
+      toast('已连接','ok');
+      refresh();
+    }).catch(function(e){
+      token='';try{sessionStorage.removeItem(TKEY);}catch(x){}
+      err.textContent=(e&&e.auth)?'令牌无效':((e&&e.message)?e.message:'连接失败');
+    });
+  });
+  inp.onkeydown=function(ev){if(ev.key==='Enter')btn.click();};
+  append(box,btn);append(ov,box);document.body.appendChild(ov);
+  setTimeout(function(){inp.focus();},30);
+}
+function logout(){token='';try{sessionStorage.removeItem(TKEY);}catch(e){}showAuth();}
+
+function render(){renderStats();renderTabs();renderView();}
+
+function stat(k,v){var s=el('span','stat');append(s,el('b',null,String(k)+' '),document.createTextNode(String(v)));return s;}
+function renderStats(){
+  var w=byId('stats');clear(w);
+  var m=S.metrics||{};var t=m.totals||{};
+  append(w,stat('运行',fmtDur(m.uptimeMs)));
+  append(w,stat('在途',(m.inflight||0)+(m.maxInflight>0?(' / '+m.maxInflight):' / ∞')));
+  append(w,stat('账号',(t.enabledAccounts||0)+' 启用 / '+(t.accounts||0)));
+  append(w,stat('健康',t.healthy||0));
+  append(w,stat('冷却',t.cooling||0));
+  append(w,stat('客户端',t.clients||0));
+  var p=el('span','stat',m.persistence===false?'仅内存（持久化失败）':'持久化正常');
+  if(m.persistence===false)p.className='stat bad';
+  append(w,p);
+}
+function renderTabs(){
+  var tabs=byId('tabs').children;
+  for(var i=0;i<tabs.length;i++){
+    if(tabs[i].getAttribute('data-tab')===S.tab)tabs[i].classList.add('active');
+    else tabs[i].classList.remove('active');
+  }
+}
+function renderView(){
+  var v=byId('view');clear(v);
+  if(S.tab==='accounts')renderAccounts(v);
+  else if(S.tab==='clients')renderClients(v);
+  else if(S.tab==='routing')renderRouting(v);
+  else renderMetrics(v);
+}
+function metricOf(id){var a=S.metrics&&S.metrics.accounts;if(!a)return null;for(var i=0;i<a.length;i++)if(a[i].id===id)return a[i];return null;}
+function healthOf(a,m){if(!a.enabled)return 'gray';if(m&&m.cooling)return 'red';if(m&&m.window&&m.window.n>=3&&(m.window.ok/m.window.n)<0.5)return 'yellow';return 'green';}
+function badgeText(h){if(h==='green')return '健康';if(h==='yellow')return '降级';if(h==='red')return '冷却';return '禁用';}
+
+function addRow(rows,k,v){rows.appendChild(el('span','k',k));rows.appendChild(el('span','v',v));}
+function fieldInput(labelText,value,type){
+  var l=el('label','field');append(l,el('span',null,labelText));
+  var i=el('input');i.type=type||'text';i.value=(value===undefined||value===null)?'':String(value);
+  append(l,i);return {el:l,inp:i};
+}
+function fieldTextarea(labelText,value){
+  var l=el('label','field');append(l,el('span',null,labelText));
+  var t=el('textarea');t.rows=3;t.value=(value===undefined||value===null)?'':String(value);
+  append(l,t);return {el:l,inp:t};
+}
+function sliderField(labelText,value,min,max,step){
+  var l=el('label','field');append(l,el('span',null,labelText));
+  var i=el('input');i.type='range';i.min=String(min);i.max=String(max);i.step=String(step);i.value=String(value);
+  var lbl=el('span','muted',String(value));
+  i.addEventListener('input',function(){lbl.textContent=i.value;});
+  append(l,i,lbl);return {el:l,inp:i};
+}
+function selectField(labelText,opts,value){
+  var l=el('label','field');append(l,el('span',null,labelText));
+  var s=el('select');
+  opts.forEach(function(o){var op=el('option',null,o[1]);op.value=o[0];if(o[0]===value)op.selected=true;s.appendChild(op);});
+  append(l,s);return {el:l,inp:s};
+}
+function confirmDelete(msg,onYes){
+  var ov=el('div','overlay');var box=el('div','modal');
+  append(box,el('h2',null,'请确认'),el('p',null,msg));
+  var act=el('div','actions');
+  act.appendChild(mkbtn('取消',null,function(){document.body.removeChild(ov);}));
+  act.appendChild(mkbtn('确认删除','danger',function(){document.body.removeChild(ov);onYes();}));
+  append(box,act);append(ov,box);document.body.appendChild(ov);
+}
+
+// ── 账号 Tab ───────────────────────────────────────
+function renderAccounts(root){
+  var head=el('div','section-head');
+  append(head,el('h2',null,'账号池'));
+  append(head,mkbtn('+ 新增账号','primary',function(){openAccountModal(null);}));
+  root.appendChild(head);
+  if(!S.accounts.length){root.appendChild(el('p','muted','暂无账号，点击右上角新增。'));return;}
+  var grid=el('div','grid');
+  S.accounts.forEach(function(a){grid.appendChild(accountCard(a,metricOf(a.id)));});
+  root.appendChild(grid);
+}
+function accountCard(a,m){
+  var h=healthOf(a,m);
+  var c=el('div','card '+h);
+  var hd=el('h3');append(hd,document.createTextNode(a.name),el('span','badge b-'+h,badgeText(h)));
+  c.appendChild(hd);
+  append(c,el('div','key',a.apiKey));
+  var wl=el('label','field');append(wl,el('span',null,'权重 '+(a.weight!==undefined?a.weight:1)+'（×流量份额）'));
+  var rng=el('input');rng.type='range';rng.min='0.1';rng.max='10';rng.step='0.1';rng.value=String(a.weight||1);
+  rng.oninput=function(){wl.firstChild.textContent='权重 '+rng.value+'（×流量份额）';};
+  rng.onchange=function(){patchAccount(a.id,{weight:Number(rng.value)});};
+  append(wl,rng);c.appendChild(wl);
+  var rows=el('div','rows');
+  var wr=m&&m.window?m.window:null;
+  var sr=wr&&wr.n>0?(wr.ok/wr.n):null;
+  addRow(rows,'成功率',sr===null?'—':(pct(sr)+'（'+(wr?wr.n:0)+' 样本）'));
+  addRow(rows,'EWMA TTFT',msfmt(m?m.ewmaTtftMs:0));
+  addRow(rows,'平均 TTFT',msfmt(wr?wr.avgTtftMs:0));
+  addRow(rows,'在途',String(m?m.inFlight:0));
+  addRow(rows,'评分',(m&&m.score!==undefined)?m.score.toFixed(3):'—');
+  addRow(rows,'冷却',(m&&m.cooling)?('剩余 '+fmtDur(m.cooldownUntil-Date.now())):'否');
+  c.appendChild(rows);
+  if(m&&m.lastError){append(c,el('div','key','最后错误: '+(m.lastError.status||'')+' '+(m.lastError.code||m.lastError.message||'')));}
+  var sw=el('label','switch');var cb=el('input');cb.type='checkbox';cb.checked=!!a.enabled;
+  cb.onchange=function(){patchAccount(a.id,{enabled:cb.checked});};
+  append(sw,cb,el('span',null,a.enabled?'已启用':'已禁用'));c.appendChild(sw);
+  var act=el('div','actions');
+  append(act,mkbtn('编辑',null,function(){openAccountModal(a);}));
+  append(act,mkbtn('测试',null,function(){testAccount(a,act);}));
+  append(act,mkbtn('重置指标',null,function(){post('/admin/api/accounts/'+a.id+'/reset-metrics').then(function(){toast('指标已重置','ok');refresh();}).catch(function(e){toast('重置失败：'+(e&&e.message?e.message:String(e)),'err');});}));
+  append(act,mkbtn('删除','danger',function(){confirmDelete('删除账号「'+a.name+'」？此操作不可撤销。',function(){del('/admin/api/accounts/'+a.id).then(function(){toast('已删除','ok');refresh();});});}));
+  c.appendChild(act);
+  return c;
+}
+function patchAccount(id,patch){
+  return api('/admin/api/accounts/'+id,{method:'PATCH',body:patch}).then(function(){return refresh();})
+    .catch(function(e){toast('更新失败：'+(e&&e.message?e.message:String(e)),'err');refresh();});
+}
+function testAccount(a,host){
+  var line=el('div','key','测试中…');host.appendChild(line);
+  api('/admin/api/accounts/'+a.id+'/test',{method:'POST'}).then(function(r){
+    var txt='测试'+(r.ok?'通过':'失败')+' · HTTP '+r.status+' · '+r.elapsedMs+'ms';
+    if(r.modelCount!==undefined)txt+=' · '+r.modelCount+' 个模型';
+    if(r.error)txt+=' · '+r.error;
+    line.textContent=txt;
+    toast(r.ok?'测试通过':'测试失败',r.ok?'ok':'err');
+  }).catch(function(e){line.textContent='测试请求失败：'+(e&&e.message?e.message:String(e));});
+}
+function openAccountModal(a){
+  var isNew=!a;
+  var ov=el('div','overlay');var box=el('div','modal');
+  append(box,el('h2',null,isNew?'新增账号':'编辑账号'));
+  var err=el('div','err');
+  var fName=fieldInput('名称',a?a.name:'');
+  var fKey=fieldInput(isNew?'API Key（user_...）':'API Key（留空则保持不变）','');
+  var fWeight=fieldInput('权重（0.1–10）',a?(a.weight!==undefined?a.weight:1):1,'number');
+  var fMax=fieldInput('最大并发 in-flight（0 = 不限）',a?a.maxInflight:0,'number');
+  var fTags=fieldInput('标签（逗号分隔）',a&&a.tags?a.tags.join(', '):'');
+  var fNotes=fieldTextarea('备注',a?a.notes:'');
+  var fEn=el('label','switch');var cb=el('input');cb.type='checkbox';cb.checked=a?a.enabled!==false:true;append(fEn,cb,el('span',null,'启用'));
+  append(box,fName.el,fKey.el,fWeight.el,fMax.el,fTags.el,fNotes.el,fEn,err);
+  var act=el('div','actions');
+  act.appendChild(mkbtn('取消',null,function(){document.body.removeChild(ov);}));
+  act.appendChild(mkbtn(isNew?'创建':'保存','primary',function(){
+    var body={};
+    body.name=fName.inp.value.trim();
+    if(fKey.inp.value.trim())body.apiKey=fKey.inp.value.trim();
+    body.weight=Number(fWeight.inp.value);
+    body.maxInflight=Number(fMax.inp.value);
+    body.tags=fTags.inp.value.split(',').map(function(s){return s.trim();}).filter(Boolean);
+    body.notes=fNotes.inp.value;
+    body.enabled=cb.checked;
+    if(isNew&&!body.apiKey){err.textContent='API Key 不能为空';return;}
+    var p=isNew?post('/admin/api/accounts',body):api('/admin/api/accounts/'+a.id,{method:'PATCH',body:body});
+    p.then(function(){document.body.removeChild(ov);toast(isNew?'账号已创建':'账号已更新','ok');refresh();})
+     .catch(function(e){err.textContent=(e&&e.message)?e.message:'操作失败';});
+  }));
+  append(box,act);append(ov,box);document.body.appendChild(ov);
+}
+
+// ── 客户端令牌 Tab ─────────────────────────────────
+function renderClients(root){
+  var head=el('div','section-head');
+  append(head,el('h2',null,'客户端令牌'));
+  append(head,mkbtn('+ 新建令牌','primary',function(){openClientModal(null);}));
+  root.appendChild(head);
+  append(root,el('p','muted','客户端用 ccp_ 令牌访问代理；明文令牌仅在创建/轮换时显示一次，请立即保存。'));
+  if(!S.clients.length){root.appendChild(el('p','muted','暂无客户端令牌。'));return;}
+  var tbl=el('table');
+  var thead=el('thead');var tr=el('tr');
+  ['名称','令牌','状态','允许账号','最近使用','操作'].forEach(function(x){append(tr,el('th',null,x));});
+  append(thead,tr);append(tbl,thead);
+  var tb=el('tbody');
+  S.clients.forEach(function(c){
+    var r=el('tr');
+    append(r,el('td',null,c.name),el('td','key',c.token),el('td',null,c.enabled?'启用':'禁用'));
+    append(r,el('td',null,c.accountIds===null?'全部':(c.accountIds.length+' 个')));
+    append(r,el('td',null,c.lastUsedAt?fmtTime(c.lastUsedAt):'—'));
+    var ops=el('td');var av=el('div','actions');
+    append(av,mkbtn('轮换','tiny',function(){rotateClient(c);}));
+    append(av,mkbtn('编辑','tiny',function(){openClientModal(c);}));
+    append(av,mkbtn('删除','tiny danger',function(){confirmDelete('删除令牌「'+c.name+'」？',function(){del('/admin/api/clients/'+c.id).then(function(){toast('已删除','ok');refresh();});});}));
+    append(ops,av);append(r,ops);
+    append(tb,r);
+  });
+  append(tbl,tb);root.appendChild(tbl);
+}
+function rotateClient(c){
+  post('/admin/api/clients/'+c.id+'/rotate').then(function(res){
+    if(res.client&&res.client.token)showTokenOnce(res.client.token,'令牌已轮换（仅显示一次）');
+    refresh();
+  }).catch(function(e){toast('轮换失败：'+(e&&e.message?e.message:String(e)),'err');});
+}
+function openClientModal(c){
+  var isNew=!c;
+  var ov=el('div','overlay');var box=el('div','modal');
+  append(box,el('h2',null,isNew?'新建客户端令牌':'编辑客户端令牌'));
+  var err=el('div','err');
+  var fName=fieldInput('名称',c?c.name:'');
+  var fEn=el('label','switch');var cb=el('input');cb.type='checkbox';cb.checked=c?c.enabled!==false:true;append(fEn,cb,el('span',null,'启用'));
+  var allowAll=el('label','switch');var ca=el('input');ca.type='checkbox';ca.checked=c?(c.accountIds===null):true;
+  append(allowAll,ca,el('span',null,'允许使用全部账号'));
+  append(box,fName.el,fEn,allowAll,el('span','muted','指定账号白名单（取消勾选「全部账号」后生效）：'));
+  var listBox=el('div');append(box,listBox);
+  var checks=[];
+  S.accounts.forEach(function(a){
+    var l=el('label','switch');var k=el('input');k.type='checkbox';
+    k.checked=!!(c&&Array.isArray(c.accountIds)&&c.accountIds.indexOf(a.id)>=0);
+    k.disabled=ca.checked;
+    append(l,k,el('span',null,a.name+'（'+a.id+'）'));
+    listBox.appendChild(l);checks.push({id:a.id,input:k});
+  });
+  if(!S.accounts.length)append(listBox,el('p','muted','（暂无账号）'));
+  ca.onchange=function(){checks.forEach(function(x){x.input.disabled=ca.checked;});};
+  append(box,err);
+  var act=el('div','actions');
+  act.appendChild(mkbtn('取消',null,function(){document.body.removeChild(ov);}));
+  act.appendChild(mkbtn(isNew?'创建':'保存','primary',function(){
+    var body={name:fName.inp.value.trim(),enabled:cb.checked};
+    if(ca.checked)body.accountIds=null;
+    else body.accountIds=checks.filter(function(x){return x.input.checked;}).map(function(x){return x.id;});
+    var p=isNew?post('/admin/api/clients',body):api('/admin/api/clients/'+c.id,{method:'PATCH',body:body});
+    p.then(function(res){
+      document.body.removeChild(ov);
+      toast(isNew?'令牌已创建':'已更新','ok');
+      if(isNew&&res.client&&res.client.token)showTokenOnce(res.client.token,'新令牌（仅显示一次）');
+      refresh();
+    }).catch(function(e){err.textContent=(e&&e.message)?e.message:'操作失败';});
+  }));
+  append(box,act);append(ov,box);document.body.appendChild(ov);
+}
+function showTokenOnce(tk,title){
+  var ov=el('div','overlay');var box=el('div','modal');
+  append(box,el('h2',null,title||'令牌'));
+  append(box,el('p',null,'请立即复制保存。关闭后将无法再次查看明文。'));
+  var sec=el('div','token-once');append(sec,el('code',null,tk));append(box,sec);
+  var act=el('div','actions');
+  act.appendChild(mkbtn('复制',null,function(){
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(tk).then(function(){toast('已复制','ok');},function(){toast('复制失败，请手动选择','err');});}
+    else toast('请手动选择复制','err');
+  }));
+  act.appendChild(mkbtn('我已保存','primary',function(){document.body.removeChild(ov);}));
+  append(box,act);append(ov,box);document.body.appendChild(ov);
+}
+
+// ── 路由配置 Tab ───────────────────────────────────
+function renderRouting(root){
+  append(root,el('h2',null,'路由配置'));
+  var R=S.routing||{};
+  var W=R.weights||{successRate:0.5,latency:0.3,load:0.2};
+  append(root,el('p','muted','评分：score = (wS·成功率 + wL·延迟 + wC·负载) × 账号权重因子。修改后立即热生效（无需重启）。'));
+  var card=el('div','card');
+  var wRow=el('div','grid');
+  var sS=sliderField('成功率权重',W.successRate,0,100,1);
+  var sL=sliderField('延迟权重',W.latency,0,100,1);
+  var sC=sliderField('负载权重',W.load,0,100,1);
+  append(wRow,sS.el,sL.el,sC.el);append(card,wRow);
+  var norm=el('div','muted');append(card,norm);
+  var g=el('div','grid');
+  var pSel=selectField('选择策略',[['weighted_random','加权随机（轮盘赌）'],['best','严格最优（best）']],R.selection||'weighted_random');
+  var pWin=fieldInput('窗口 windowSizeMs',R.windowSizeMs||300000,'number');
+  var pAlpha=fieldInput('先验 priorAlpha',R.priorAlpha!==undefined?R.priorAlpha:5,'number');
+  var pPsr=fieldInput('先验成功率 priorSuccessRate',R.priorSuccessRate!==undefined?R.priorSuccessRate:0.8,'number');
+  var pEwma=fieldInput('EWMA 系数 latencyEwmaAlpha',R.latencyEwmaAlpha!==undefined?R.latencyEwmaAlpha:0.3,'number');
+  var pFloor=fieldInput('延迟下限 latencyFloorMs',R.latencyFloorMs||400,'number');
+  var pCeil=fieldInput('延迟上限 latencyCeilMs',R.latencyCeilMs||60000,'number');
+  var pUnk=fieldInput('无样本延迟分 unknownLatencyScore',R.unknownLatencyScore!==undefined?R.unknownLatencyScore:0.5,'number');
+  var pRef=fieldInput('负载参考 loadReference',R.loadReference||4,'number');
+  var pCb=fieldInput('冷却基数 cooldownBaseMs',R.cooldownBaseMs||30000,'number');
+  var pCm=fieldInput('冷却上限 cooldownMaxMs',R.cooldownMaxMs||300000,'number');
+  var pTh=fieldInput('连续失败阈值 failureCooldownThreshold',R.failureCooldownThreshold||3,'number');
+  [pSel.el,pWin.el,pAlpha.el,pPsr.el,pEwma.el,pFloor.el,pCeil.el,pUnk.el,pRef.el,pCb.el,pCm.el,pTh.el].forEach(function(x){g.appendChild(x);});
+  append(card,g);
+  append(card,el('h3',null,'策略预览（按当前滑杆值实时计算）'));
+  var prevBox=el('div');append(card,prevBox);
+  var err=el('div','err');append(card,err);
+  var act=el('div','actions');
+  act.appendChild(mkbtn('保存路由配置','primary',function(){
+    var body={
+      selection:pSel.inp.value,
+      windowSizeMs:Number(pWin.inp.value),
+      priorAlpha:Number(pAlpha.inp.value),
+      priorSuccessRate:Number(pPsr.inp.value),
+      latencyEwmaAlpha:Number(pEwma.inp.value),
+      latencyFloorMs:Number(pFloor.inp.value),
+      latencyCeilMs:Number(pCeil.inp.value),
+      unknownLatencyScore:Number(pUnk.inp.value),
+      loadReference:Number(pRef.inp.value),
+      cooldownBaseMs:Number(pCb.inp.value),
+      cooldownMaxMs:Number(pCm.inp.value),
+      failureCooldownThreshold:Number(pTh.inp.value),
+      weights:{successRate:Number(sS.inp.value)/100,latency:Number(sL.inp.value)/100,load:Number(sC.inp.value)/100}
+    };
+    api('/admin/api/routing',{method:'PUT',body:body}).then(function(){toast('路由配置已更新','ok');refresh();})
+      .catch(function(e){err.textContent=(e&&e.message)?e.message:'保存失败';});
+  }));
+  append(card,act);
+  root.appendChild(card);
+  function updatePreview(){
+    var ws=Number(sS.inp.value),wl=Number(sL.inp.value),wc=Number(sC.inp.value);
+    var sum=ws+wl+wc;
+    norm.textContent='归一化权重：成功率 '+(sum>0?(ws/sum*100).toFixed(1):'0')+'% · 延迟 '+(sum>0?(wl/sum*100).toFixed(1):'0')+'% · 负载 '+(sum>0?(wc/sum*100).toFixed(1):'0')+'%';
+    clear(prevBox);
+    var acc=(S.metrics&&S.metrics.accounts)||[];
+    var maxW=0;acc.forEach(function(a){if(a.enabled&&a.weight>maxW)maxW=a.weight;});
+    var tbl=el('table');var thead=el('thead');var tr=el('tr');
+    ['账号','成功率S','延迟L','负载C','权重因子','评分','状态'].forEach(function(x){append(tr,el('th',null,x));});
+    append(thead,tr);append(tbl,thead);
+    var tb=el('tbody');
+    acc.forEach(function(a){
+      var cp=a.components||{};
+      var s=sum>0?sum:1;
+      var base=(ws/s)*(cp.success||0)+(wl/s)*(cp.latency||0)+(wc/s)*(cp.load||0);
+      var wf=maxW>0?(a.weight/maxW):1;
+      var sc=a.cooling?0:base*wf;
+      var r=el('tr');
+      append(r,el('td',null,a.name));
+      append(r,el('td',null,(cp.success!==undefined?cp.success:0).toFixed(3)));
+      append(r,el('td',null,(cp.latency!==undefined?cp.latency:0).toFixed(3)));
+      append(r,el('td',null,(cp.load!==undefined?cp.load:0).toFixed(3)));
+      append(r,el('td',null,wf.toFixed(2)));
+      append(r,el('td',null,sc.toFixed(3)));
+      append(r,el('td',null,a.cooling?'冷却':(a.enabled?'正常':'禁用')));
+      append(tb,r);
+    });
+    append(tbl,tb);prevBox.appendChild(tbl);
+  }
+  sS.inp.addEventListener('input',updatePreview);
+  sL.inp.addEventListener('input',updatePreview);
+  sC.inp.addEventListener('input',updatePreview);
+  updatePreview();
+}
+
+// ── 指标 Tab ───────────────────────────────────────
+function renderMetrics(root){
+  append(root,el('h2',null,'指标'));
+  var m=S.metrics;
+  if(!m){append(root,el('p','muted','加载中…'));return;}
+  var t=m.totals||{};
+  var sum=el('div','stats');
+  append(sum,stat('账号',t.accounts||0),stat('启用',t.enabledAccounts||0),stat('健康',t.healthy||0),stat('冷却',t.cooling||0));
+  append(sum,stat('全局在途',m.inflight||0));
+  append(sum,stat('上游重试',(m.upstreamRetryStats?m.upstreamRetryStats.rewinds:0)+' 次 / 恢复 '+(m.upstreamRetryStats?m.upstreamRetryStats.recovered:0)));
+  root.appendChild(sum);
+  var tbl=el('table');var thead=el('thead');var tr=el('tr');
+  ['账号','状态','成功率','平均TTFT','EWMA','在途','请求','成功','失败','中性','重试','评分'].forEach(function(x){append(tr,el('th',null,x));});
+  append(thead,tr);append(tbl,thead);
+  var tb=el('tbody');
+  (m.accounts||[]).forEach(function(a){
+    var w=a.window||{};var sr=w.n>0?(w.ok/w.n):null;
+    var r=el('tr');
+    append(r,el('td',null,a.name),el('td',null,a.cooling?'冷却':(a.enabled?'正常':'禁用')));
+    var td=el('td');var bar=el('div','bar');var fill=el('i');
+    fill.style.width=(sr===null?'0':(Math.round(sr*100)+'%'));
+    if(sr!==null&&sr<0.5)fill.style.background='#f85149';
+    else if(sr!==null&&sr<0.8)fill.style.background='#d29922';
+    append(bar,fill);append(td,bar,document.createTextNode(' '+(sr===null?'—':pct(sr))));append(r,td);
+    append(r,el('td',null,msfmt(w.avgTtftMs)),el('td',null,msfmt(a.ewmaTtftMs)),el('td',null,String(a.inFlight)));
+    var tt=a.totals||{};
+    append(r,el('td',null,String(tt.requests||0)),el('td',null,String(tt.ok||0)),el('td',null,String(tt.fail||0)));
+    append(r,el('td',null,String(tt.neutral||0)),el('td',null,String(tt.retried||0)));
+    append(r,el('td',null,(a.score!==undefined)?a.score.toFixed(3):'—'));
+    append(tb,r);
+  });
+  append(tbl,tb);root.appendChild(tbl);
+}
+
+function boot(){
+  byId('logout').onclick=logout;
+  var tabs=byId('tabs').children;
+  for(var i=0;i<tabs.length;i++){
+    (function(b){b.onclick=function(){S.tab=b.getAttribute('data-tab');renderTabs();renderView();};})(tabs[i]);
+  }
+  setInterval(function(){if(token&&!document.hidden)refresh();},2000);
+  document.addEventListener('visibilitychange',function(){if(token&&!document.hidden)refresh();});
+  if(token){byId('app').hidden=false;refresh();}
+  else showAuth();
+}
+boot();
+})();
+</script>
+</body>
+</html>`;
+  res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-" + nonce + "'; connect-src 'self'; img-src 'self' data:");
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'no-store');
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
+}
+
+async function handleAdmin(req, res, url) {
+  // 未配置令牌：admin 路径一律 404（不暴露存在），启动后仅告警一次
+  if (!adminEnabled()) {
+    if (!ADMIN_DISABLED_WARNED) {
+      ADMIN_DISABLED_WARNED = true;
+      log('warn', 'Admin API disabled (set CC_ADMIN_TOKEN to enable /admin)');
+    }
+    sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
+    return;
+  }
+
+  const pathname = url.pathname;
+  if (pathname === '/admin' || pathname === '/admin/') {
+    if (req.method !== 'GET') {
+      adminJSON(res, 405, { error: { message: 'Method not allowed', type: 'method_not_allowed' } });
+      return;
+    }
+    sendAdminShell(req, res);
+    return;
+  }
+
+  if (!pathname.startsWith('/admin/api/')) {
+    sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
+    return;
+  }
+
+  if (!checkAdminAuth(req)) {
+    adminJSON(res, 401, { error: { message: 'Unauthorized', type: 'unauthorized' } });
+    return;
+  }
+
+  const segs = pathname.slice('/admin/api/'.length).split('/').filter(Boolean);
+  const method = req.method;
+  const fail = (status, message, type = 'error') => adminJSON(res, status, { error: { message, type } });
+
+  let bodyCache = null;
+  const getBody = async () => { if (bodyCache === null) bodyCache = await readAdminBody(req); return bodyCache; };
+
+  try {
+    // ── /admin/api/accounts ─────────────────────────────
+    if (segs[0] === 'accounts' && segs.length === 1) {
+      if (method === 'GET') {
+        return adminJSON(res, 200, {
+          accounts: STORE.accounts.map(accountView),
+          routing: STORE.routing,
+          limits: { maxAccounts: MAX_ACCOUNTS },
+          ...persistWarning(),
+        });
+      }
+      if (method === 'POST') {
+        const body = await getBody();
+        const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+        if (!apiKey) return fail(400, 'apiKey is required', 'invalid_request');
+        if (STORE.accounts.length >= MAX_ACCOUNTS) return fail(409, 'Account limit reached (' + MAX_ACCOUNTS + ')', 'limit_reached');
+        const nowIso = new Date().toISOString();
+        const account = normalizeAccount({ ...body, id: newId('acc_'), apiKey, createdAt: nowIso, updatedAt: nowIso });
+        STORE.accounts.push(account);
+        getRuntime(account.id);
+        persistAccounts();
+        log('info', 'Admin: account added', { accountId: account.id, name: account.name });
+        return adminJSON(res, 201, { account: accountView(account), ...persistWarning() });
+      }
+      return fail(405, 'Method not allowed', 'method_not_allowed');
+    }
+
+    // ── /admin/api/accounts/:id[/test|/reset-metrics] ───
+    if (segs[0] === 'accounts' && segs.length >= 2) {
+      const id = segs[1];
+      const idx = findAccountIndex(id);
+      if (idx < 0) return fail(404, 'Account not found', 'not_found');
+
+      if (segs.length === 2) {
+        if (method === 'GET') return adminJSON(res, 200, { account: accountView(STORE.accounts[idx]) });
+        if (method === 'PATCH') {
+          const body = await getBody();
+          const merged = { ...STORE.accounts[idx] };
+          if (body.name !== undefined) merged.name = body.name;
+          if (body.apiKey !== undefined) {
+            if (typeof body.apiKey !== 'string' || !body.apiKey.trim()) return fail(400, 'apiKey must be a non-empty string', 'invalid_request');
+            merged.apiKey = body.apiKey.trim();
+          }
+          if (body.enabled !== undefined) merged.enabled = body.enabled !== false;
+          if (body.weight !== undefined) merged.weight = body.weight;
+          if (body.priority !== undefined) merged.priority = body.priority;
+          if (body.maxInflight !== undefined) merged.maxInflight = body.maxInflight;
+          if (body.tags !== undefined) merged.tags = body.tags;
+          if (body.notes !== undefined) merged.notes = body.notes;
+          merged.updatedAt = new Date().toISOString();
+          const next = normalizeAccount(merged);
+          STORE.accounts[idx] = next;
+          persistAccounts();
+          return adminJSON(res, 200, { account: accountView(next), ...persistWarning() });
+        }
+        if (method === 'DELETE') {
+          const removed = STORE.accounts.splice(idx, 1)[0];
+          runtime.delete(removed.id);
+          // 同步从所有 client 白名单剔除，避免指向已删账号
+          for (const c of STORE.clients) {
+            if (Array.isArray(c.accountIds)) c.accountIds = c.accountIds.filter(x => x !== removed.id);
+          }
+          persistAccounts();
+          log('info', 'Admin: account removed', { accountId: removed.id, name: removed.name });
+          return adminJSON(res, 200, { ok: true, id: removed.id, ...persistWarning() });
+        }
+        return fail(405, 'Method not allowed', 'method_not_allowed');
+      }
+
+      if (segs.length === 3 && segs[2] === 'test' && method === 'POST') {
+        // 防 SSRF：只打 CFG.apiBase，不接受任何 URL 参数；不回显响应体与 key
+        const account = STORE.accounts[idx];
+        const startedAt = Date.now();
+        try {
+          const resp = await fetch(CFG.apiBase + '/provider/v1/models', {
+            headers: {
+              'Authorization': 'Bearer ' + account.apiKey,
+              'x-cli-environment': 'production',
+              'x-command-code-version': CC_VERSION,
+            },
+            signal: AbortSignal.timeout(10000),
+          });
+          let modelCount;
+          try {
+            const data = await resp.json();
+            if (data && Array.isArray(data.data)) modelCount = data.data.length;
+          } catch {}
+          const out = { ok: resp.ok, status: resp.status, elapsedMs: Date.now() - startedAt };
+          if (modelCount !== undefined) out.modelCount = modelCount;
+          return adminJSON(res, 200, out);
+        } catch (e) {
+          return adminJSON(res, 200, {
+            ok: false, status: 0, elapsedMs: Date.now() - startedAt,
+            error: e && e.name === 'TimeoutError' ? 'timeout' : 'network_error',
+          });
+        }
+      }
+
+      if (segs.length === 3 && segs[2] === 'reset-metrics' && method === 'POST') {
+        resetRuntime(STORE.accounts[idx].id);
+        return adminJSON(res, 200, { ok: true, id: STORE.accounts[idx].id });
+      }
+      return fail(404, 'Not found', 'not_found');
+    }
+
+    // ── /admin/api/clients ──────────────────────────────
+    if (segs[0] === 'clients' && segs.length === 1) {
+      if (method === 'GET') {
+        return adminJSON(res, 200, {
+          clients: STORE.clients.map(clientView),
+          limits: { maxClients: MAX_CLIENTS, maxAccounts: MAX_ACCOUNTS },
+          ...persistWarning(),
+        });
+      }
+      if (method === 'POST') {
+        const body = await getBody();
+        if (STORE.clients.length >= MAX_CLIENTS) return fail(409, 'Client limit reached (' + MAX_CLIENTS + ')', 'limit_reached');
+        const ids = validateAccountIds(body.accountIds);
+        if (!ids.ok) return fail(400, ids.error, 'invalid_request');
+        const nowIso = new Date().toISOString();
+        const client = normalizeClient({
+          id: newId('cli_'), name: body.name, enabled: body.enabled,
+          accountIds: ids.value, notes: body.notes, token: newClientToken(),
+          createdAt: nowIso, updatedAt: nowIso,
+        });
+        STORE.clients.push(client);
+        persistAccounts();
+        log('info', 'Admin: client added', { clientId: client.id, name: client.name });
+        // 明文令牌仅此一次返回
+        return adminJSON(res, 201, { client: { ...clientView(client), token: client.token }, ...persistWarning() });
+      }
+      return fail(405, 'Method not allowed', 'method_not_allowed');
+    }
+
+    // ── /admin/api/clients/:id[/rotate] ─────────────────
+    if (segs[0] === 'clients' && segs.length >= 2) {
+      const id = segs[1];
+      const idx = findClientIndex(id);
+      if (idx < 0) return fail(404, 'Client not found', 'not_found');
+
+      if (segs.length === 2) {
+        if (method === 'GET') return adminJSON(res, 200, { client: clientView(STORE.clients[idx]) });
+        if (method === 'PATCH') {
+          const body = await getBody();
+          const merged = { ...STORE.clients[idx] };
+          if (body.name !== undefined) merged.name = body.name;
+          if (body.enabled !== undefined) merged.enabled = body.enabled !== false;
+          if (body.notes !== undefined) merged.notes = body.notes;
+          if (body.accountIds !== undefined) {
+            const ids = validateAccountIds(body.accountIds);
+            if (!ids.ok) return fail(400, ids.error, 'invalid_request');
+            merged.accountIds = ids.value;
+          }
+          merged.updatedAt = new Date().toISOString();
+          const next = normalizeClient(merged);
+          STORE.clients[idx] = next;
+          persistAccounts();
+          return adminJSON(res, 200, { client: clientView(next), ...persistWarning() });
+        }
+        if (method === 'DELETE') {
+          const removed = STORE.clients.splice(idx, 1)[0];
+          persistAccounts();
+          log('info', 'Admin: client removed', { clientId: removed.id, name: removed.name });
+          return adminJSON(res, 200, { ok: true, id: removed.id, ...persistWarning() });
+        }
+        return fail(405, 'Method not allowed', 'method_not_allowed');
+      }
+
+      if (segs.length === 3 && segs[2] === 'rotate' && method === 'POST') {
+        const client = STORE.clients[idx];
+        client.token = newClientToken();
+        client.updatedAt = new Date().toISOString();
+        persistAccounts();
+        log('info', 'Admin: client token rotated', { clientId: client.id, name: client.name });
+        return adminJSON(res, 200, { client: { ...clientView(client), token: client.token }, ...persistWarning() });
+      }
+      return fail(404, 'Not found', 'not_found');
+    }
+
+    // ── /admin/api/routing ──────────────────────────────
+    if (segs[0] === 'routing' && segs.length === 1) {
+      if (method === 'GET') return adminJSON(res, 200, { routing: STORE.routing });
+      if (method === 'PUT') {
+        const body = await getBody();
+        if (body.weights && typeof body.weights === 'object') {
+          const cur = STORE.routing.weights;
+          const sum = Number(body.weights.successRate ?? cur.successRate)
+            + Number(body.weights.latency ?? cur.latency)
+            + Number(body.weights.load ?? cur.load);
+          if (!(sum > 0)) return fail(400, 'routing weights must sum to a positive value', 'invalid_request');
+        }
+        const next = applyRouting(body);   // 字段级 merge + 原地赋值（热生效，不换引用）
+        persistAccounts();
+        return adminJSON(res, 200, { routing: next, ...persistWarning() });
+      }
+      return fail(405, 'Method not allowed', 'method_not_allowed');
+    }
+
+    // ── /admin/api/metrics ──────────────────────────────
+    if (segs[0] === 'metrics' && segs.length === 1 && method === 'GET') {
+      const now = Date.now();
+      const routing = STORE.routing;
+      const enabledAccounts = STORE.accounts.filter(a => a.enabled);
+      const maxWeight = enabledAccounts.reduce((m, a) => Math.max(m, a.weight), 0);
+      let healthy = 0, cooling = 0;
+      const accounts = STORE.accounts.map(a => {
+        const r = getRuntime(a.id);
+        const st = windowStats(r, now, routing);
+        const { score, components } = scoreAccount(a, r, now, routing, maxWeight);
+        if (a.enabled) { if (r.cooldownUntil > now) cooling++; else healthy++; }
+        return {
+          id: a.id, name: a.name, enabled: a.enabled, weight: a.weight,
+          score, components,
+          totals: { ...r.totals },
+          window: { ok: st.ok, fail: st.fail, n: st.n, avgTtftMs: st.ttftCount > 0 ? st.ttftSum / st.ttftCount : null },
+          inFlight: r.inFlight,
+          consecutiveFailures: r.consecutiveFailures,
+          cooldownUntil: r.cooldownUntil,
+          cooling: r.cooldownUntil > now,
+          ewmaTtftMs: r.ewmaTtftMs,
+          lastLatencyMs: r.lastLatencyMs,
+          lastError: r.lastError,
+        };
+      });
+      return adminJSON(res, 200, {
+        uptimeMs: Date.now() - SERVER_STARTED_AT,
+        startedAt: new Date(SERVER_STARTED_AT).toISOString(),
+        inflight: inflightCount,
+        maxInflight: MAX_INFLIGHT,
+        upstreamRetryStats: { ...upstreamRetryStats },
+        persistence: PERSISTENCE_OK,
+        totals: {
+          accounts: STORE.accounts.length,
+          clients: STORE.clients.length,
+          enabledAccounts: enabledAccounts.length,
+          disabledAccounts: STORE.accounts.length - enabledAccounts.length,
+          healthy, cooling,
+        },
+        routing,
+        accounts,
+      });
+    }
+
+    // ── /admin/api/config ───────────────────────────────
+    if (segs[0] === 'config' && segs.length === 1 && method === 'GET') {
+      return adminJSON(res, 200, {
+        port: CFG.port, host: CFG.host, apiBase: CFG.apiBase,
+        projectSlug: CFG.projectSlug, logLevel: CFG.logLevel,
+        useProviderModels: CFG.useProviderModels, zdr: CFG.zdr,
+        upstreamProxy: !!CFG.upstreamProxy,
+        adminEnabled: true, persistence: PERSISTENCE_OK,
+        accountsFile: CFG.accountsFile,
+        limits: { maxAccounts: MAX_ACCOUNTS, maxClients: MAX_CLIENTS },
+        version: STORE.version,
+      });
+    }
+
+    return fail(404, 'Not found', 'not_found');
+  } catch (e) {
+    const status = e && e.statusCode ? e.statusCode : 500;
+    if (status >= 500) log('error', 'Admin API error', { method, path: pathname, error: e && e.message });
+    return fail(status, status >= 500 ? 'Internal error' : (e && e.message ? e.message : 'error'), status >= 500 ? 'internal_error' : 'invalid_request');
+  }
+}
+
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
+  const host = req.headers.host || 'localhost';
+  const url = new URL(req.url, `http://${host}`);
+  const isAdminPath = url.pathname === '/admin' || url.pathname.startsWith('/admin/');
+
+  // CORS：仅数据面发 ACAO:*。管理面同源自定义头不触发预检，避免引入 CSRF 面。
+  if (!isAdminPath) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PATCH, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+  }
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
     return;
   }
 
-  const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
-
-  // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
-  const isLiveness = url.pathname === '/health' || url.pathname === '/';
-  if (!isLiveness && MAX_INFLIGHT > 0) {
-    if (inflightCount >= MAX_INFLIGHT) {
+  // 在途上限准入。/health、/ 与 admin 路径例外：探活/编排器/后台救火不该因业务繁忙而收 503。
+  const isLiveness = url.pathname === '/health' || url.pathname === '/' || isAdminPath;
+  if (!isLiveness) {
+    if (MAX_INFLIGHT > 0 && inflightCount >= MAX_INFLIGHT) {
       log('warn', 'In-flight limit reached, rejecting request', {
         maxInflight: MAX_INFLIGHT, inflight: inflightCount, path: url.pathname,
       });
@@ -3693,6 +5252,8 @@ const server = http.createServer(async (req, res) => {
       await handleModels(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
+    } else if (isAdminPath) {
+      await handleAdmin(req, res, url);
     } else {
       sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
     }
@@ -3750,6 +5311,9 @@ server.listen(CFG.port, CFG.host, () => {
     upstreamRetry: UPSTREAM_RETRY_MAX > 0
       ? `${UPSTREAM_RETRY_MAX} retries, base ${UPSTREAM_RETRY_BASE_MS}ms (only before first byte)`
       : 'disabled (CC_UPSTREAM_RETRY_MAX=0)',
+    accounts: `${STORE.accounts.length} account(s), ${STORE.clients.length} client token(s)`,
+    admin: adminEnabled() ? `/admin enabled (accountsFile: ${CFG.accountsFile})` : '/admin disabled (set CC_ADMIN_TOKEN to enable)',
+    persistence: PERSISTENCE_OK ? 'ok' : 'DISABLED (memory-only; check accountsFile permissions)',
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });

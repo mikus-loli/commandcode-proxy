@@ -34,6 +34,7 @@ commandcode/
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # Single-file proxy core (~1900 lines)
+├── accounts.json         # Account pool / client tokens / routing (created at runtime, git-ignored)
 ├── Dockerfile            # Container build (node:22-alpine)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
@@ -66,6 +67,8 @@ commandcode/
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
 | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+| `adminToken` | `""` | Admin console token for `/admin`. **Empty = admin disabled** (`/admin*` returns 404). Pass it via `CC_ADMIN_TOKEN` instead of committing it |
+| `accountsFile` | `accounts.json` | Account-pool data file (relative to the proxy dir, or an absolute path such as `/app/data/accounts.json`) |
 
 ### Environment Variables
 
@@ -93,6 +96,8 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
+| `CC_ADMIN_TOKEN` | empty | Admin console token → `adminToken`. Empty disables `/admin`. See [Multi-account & smart routing](#multi-account--smart-routing) |
+| `CC_ACCOUNTS_FILE` | `accounts.json` | Account-pool file path → `accountsFile` (absolute paths allowed) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -522,6 +527,105 @@ The CLI sends images in this format:
 
 The proxy receives OpenAI `image_url` format and converts it to the above CC format transparently.
 
+## Multi-account & smart routing
+
+The proxy can host a **pool of upstream Command Code accounts** instead of passing every
+client's `user_xxx` key straight through. Downstream clients authenticate with proxy-issued
+`ccp_*` tokens; the real upstream keys never leave the proxy.
+
+```
+client --(ccp_ token)--> handler
+                          └─ resolveRoute(headers)
+                               ├─ client token   → pick account by score → upstream key + release(outcome)
+                               ├─ user_xxx key   → legacy passthrough (unchanged, not metered)
+                               └─ otherwise      → 401 (same wording as before)
+```
+
+**Data model** (`accounts.json`, atomic write + `0600`):
+
+```json
+{
+  "version": 1,
+  "accounts": [{ "id": "acc_…", "name": "primary-A", "apiKey": "user_…",
+    "enabled": true, "weight": 1, "priority": 0, "maxInflight": 0,
+    "tags": [], "notes": "", "createdAt": "…", "updatedAt": "…" }],
+  "clients": [{ "id": "cli_…", "name": "cursor-local", "token": "ccp_…",
+    "enabled": true, "accountIds": null, "notes": "",
+    "createdAt": "…", "updatedAt": "…", "lastUsedAt": null }],
+  "routing": { "strategy": "weighted", "selection": "weighted_random",
+    "weights": { "successRate": 0.5, "latency": 0.3, "load": 0.2 },
+    "windowSizeMs": 300000, "bucketMs": 30000,
+    "priorAlpha": 5, "priorSuccessRate": 0.8,
+    "latencyEwmaAlpha": 0.3, "latencyFloorMs": 400, "latencyCeilMs": 60000,
+    "unknownLatencyScore": 0.5, "loadReference": 4,
+    "cooldownBaseMs": 30000, "cooldownMaxMs": 300000, "failureCooldownThreshold": 3,
+    "countTimeoutsAsFailure": true, "countRateLimitAsFailure": true, "penalizeAuthErrors": false }
+}
+```
+
+`accountIds: null` means "all accounts allowed"; an array is an explicit whitelist.
+
+**Scoring** — eligible accounts are filtered by `enabled` → client whitelist → `maxInflight`
+saturation → cooldown (soft). Three normalised components (higher is better, `∈[0,1]`):
+
+- **Success rate** (Beta prior avoids cold-start bias): `S = (ok + priorAlpha·priorSuccessRate) / (n + priorAlpha)`
+- **Latency**: `L = clamp((ceil − ewmaTtftMs) / (ceil − floor), 0, 1)`; `unknownLatencyScore` when no samples
+- **Load**: `maxInflight > 0 ? 1 − inFlight/maxInflight : 1/(1 + inFlight/loadReference)`
+
+Composition: weights are normalised internally → `base = wS·S + wL·L + wC·C`; the account weight
+is a multiplier `weightFactor = weight / maxWeightInEligible`; `score = base × weightFactor`
+(cooldown → `0`). Ties break deterministically: score → fewer in-flight → smaller EWMA → LRU → id.
+
+Selection is `weighted_random` (roulette — `weight` is effectively a traffic share) by default;
+`selection: "best"` forces strict argmax (useful for testing/troubleshooting).
+
+**Degradation & recovery**: `failureCooldownThreshold` consecutive failures put an account into
+exponential cooldown (`min(base·2^level, max)`); it returns to the eligible set when cooldown
+expires, and the next success resets everything. If *every* account is cooling, the proxy
+fail-opens to the earliest-expiring one instead of returning 503. Metrics reset manually via
+`POST /admin/api/accounts/:id/reset-metrics`.
+
+**Success-rate windows are bucketed in memory** (`windowSizeMs / bucketMs`), so cost is O(accounts).
+
+**Accounting (one terminal outcome per client request — internal retries do not double-count):**
+
+| Terminal state | Recorded as |
+|---|---|
+| Stream completed / non-stream `200` | ok (`attempt>1` and delivered → ok + `retried`) |
+| Upstream `429`/`402`→`429`, zero-output `429`, idle-timeout `429` | fail |
+| Truncated without finish → `502`, transport `502`, upstream `5xx`/`503` | fail |
+| Upstream `400`/`404`/`422` (client error, another account won't help) | not counted |
+| Upstream `401`/`403` | only `lastError`, counted per `penalizeAuthErrors` |
+| Client aborted | not counted (in-flight still released) |
+
+TTFT (time to first byte from upstream) is the latency signal; total duration is display-only.
+
+**Hot reload vs. restart** — accounts, client tokens/rotation, all `routing` fields and metric
+resets take effect immediately (in-memory object mutated field-by-field, never re-referenced).
+`port`, `host`, `apiBase`, `adminToken`, `accountsFile`, `logFile`, `upstreamProxy` and the
+existing timeout env vars still require a restart.
+
+## Admin Console
+
+Set `CC_ADMIN_TOKEN` and open `http://<host>:<port>/admin`.
+
+- `/admin` is a **zero-secret HTML shell** (no token needed to load it); the token is entered in a
+  dialog, kept only in `sessionStorage`, and sent via the `x-admin-token` header.
+- `/admin/api/*` is fully token-gated (`x-admin-token` or `Bearer`), compared with a
+  time-constant function; failures are a uniform `401`. **With no token configured, `/admin*` returns 404.**
+- Endpoints: `GET|POST /admin/api/accounts`, `PATCH|DELETE /admin/api/accounts/:id`,
+  `POST /admin/api/accounts/:id/test` (probes `apiBase` only, 10s timeout, never echoes the body/key),
+  `POST /admin/api/accounts/:id/reset-metrics`, `GET|POST /admin/api/clients`,
+  `PATCH|DELETE /admin/api/clients/:id`, `POST /admin/api/clients/:id/rotate`,
+  `GET|PUT /admin/api/routing`, `GET /admin/api/metrics`, `GET /admin/api/config`.
+- **Secrets never leave masked**: account keys are always shown as `maskKey` (`first8…last4`), and a
+  client token is returned in plaintext **only once** on create/rotate.
+- Four tabs: accounts (cards with masked key, enable toggle, weight slider, live success/TTFT/in-flight/cooldown),
+  client tokens, routing config (sliders with live score preview), and metrics (tables + CSS bars). Metrics poll every 2s.
+- Security: CSP with per-response nonce, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  the admin plane does **not** emit `Access-Control-Allow-Origin: *`, and the test endpoint takes no URL
+  (no SSRF).
+
 ## Docker Deployment
 
 ### Pull from GHCR
@@ -567,12 +671,14 @@ npm run docker:build:multi
 
 ### Environment Variables
 
-Only two are container-specific; everything else lives in the [Environment Variables](#environment-variables) table above:
+Only the following are container-specific; everything else lives in the [Environment Variables](#environment-variables) table above:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3050` | Container listen port |
 | `PROXY_PORT` | `3050` | Host port (compose only) |
+| `CC_ADMIN_TOKEN` | empty | Enables the `/admin` console; empty keeps it off |
+| `CC_ACCOUNTS_FILE` | `/app/data/accounts.json` | Account-pool file inside the container (compose mounts `./data:/app/data` so it survives rebuilds) |
 
 ## In-flight Cap (Optional)
 

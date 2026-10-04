@@ -124,7 +124,7 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
   if (!up) { child.kill(); throw new Error('proxy did not start:\n' + logs.join('')); }
 
   return {
-    port, base, child, logs: () => logs.join(''),
+    port, base, child, logs: () => logs.join(''), workdir,
     get: (path, init) => fetch(base + path, init),
     post: (path, body, headers = {}) => fetch(base + path, {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...headers },

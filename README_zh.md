@@ -34,6 +34,7 @@ commandcode/
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # 单文件核心代理（~1900 行）
+├── accounts.json         # 账号池 / 客户端令牌 / 路由配置（运行时生成，已 gitignore）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
@@ -66,6 +67,8 @@ commandcode/
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
+| `adminToken` | `""` | 管理后台令牌。**空 = 关闭后台**（`/admin*` 返回 404）。建议用 `CC_ADMIN_TOKEN` 传入，不要提交进仓库 |
+| `accountsFile` | `accounts.json` | 账号池数据文件（相对代理目录，或绝对路径如 `/app/data/accounts.json`）|
 
 ### 环境变量
 
@@ -93,6 +96,8 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
+| `CC_ADMIN_TOKEN` | 空 | 管理后台令牌 → `adminToken`。空则关闭 `/admin`，见[多账号与智能路由](#多账号与智能路由) |
+| `CC_ACCOUNTS_FILE` | `accounts.json` | 账号池文件路径 → `accountsFile`（支持绝对路径）|
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -517,6 +522,98 @@ CLI 发送图片的格式：
 
 代理收到 OpenAI `image_url` 格式后自动转为上述 CC 格式透传。
 
+## 多账号与智能路由
+
+代理可以**集中托管一批上游 Command Code 账号**，而不必把每个客户端的 `user_xxx` key 原样透传。
+下游客户端用代理签发的 `ccp_*` 令牌鉴权，真实的上游 key 永不外泄。
+
+```
+客户端 --(ccp_ 令牌)--> handler
+                         └─ resolveRoute(headers)
+                              ├─ 命中 client 令牌 → 评分选账号 → 上游 key + release(outcome)
+                              ├─ 形如 user_xxx    → legacy 直通（行为与改造前逐字一致，不计指标）
+                              └─ 其它/空          → 401（文案与改造前一致）
+```
+
+**数据模型**（`accounts.json`，原子写 + `0600`）：
+
+```json
+{
+  "version": 1,
+  "accounts": [{ "id": "acc_…", "name": "主账号-A", "apiKey": "user_…",
+    "enabled": true, "weight": 1, "priority": 0, "maxInflight": 0,
+    "tags": [], "notes": "", "createdAt": "…", "updatedAt": "…" }],
+  "clients": [{ "id": "cli_…", "name": "cursor-本机", "token": "ccp_…",
+    "enabled": true, "accountIds": null, "notes": "",
+    "createdAt": "…", "updatedAt": "…", "lastUsedAt": null }],
+  "routing": { "strategy": "weighted", "selection": "weighted_random",
+    "weights": { "successRate": 0.5, "latency": 0.3, "load": 0.2 },
+    "windowSizeMs": 300000, "bucketMs": 30000,
+    "priorAlpha": 5, "priorSuccessRate": 0.8,
+    "latencyEwmaAlpha": 0.3, "latencyFloorMs": 400, "latencyCeilMs": 60000,
+    "unknownLatencyScore": 0.5, "loadReference": 4,
+    "cooldownBaseMs": 30000, "cooldownMaxMs": 300000, "failureCooldownThreshold": 3,
+    "countTimeoutsAsFailure": true, "countRateLimitAsFailure": true, "penalizeAuthErrors": false }
+}
+```
+
+`accountIds: null` 表示「允许全部账号」；数组则是显式白名单。
+
+**评分** —— 合格账号依次经过 `enabled` → client 白名单 → `maxInflight` 饱和硬排除 → 冷却软排除。
+三个归一化分量（越大越好，`∈[0,1]`）：
+
+- **成功率**（Beta 先验解决冷启动）：`S = (ok + priorAlpha·priorSuccessRate) / (n + priorAlpha)`
+- **延迟**：`L = clamp((ceil − ewmaTtftMs) / (ceil − floor), 0, 1)`；无样本时用 `unknownLatencyScore`
+- **负载**：`maxInflight > 0 ? 1 − inFlight/maxInflight : 1/(1 + inFlight/loadReference)`
+
+合成：权重内部归一化 → `base = wS·S + wL·L + wC·C`；账号权重作乘子
+`weightFactor = weight / maxWeightInEligible`；`score = base × weightFactor`（冷却中为 `0`）。
+并列打破（确定性）：score → inFlight 少 → ewmaTtft 小 → LRU → id 字典序。
+
+默认 `weighted_random` 轮盘赌（`weight` 即流量份额）；`selection: "best"` 则严格 argmax（测试/排障用）。
+
+**失败降级与恢复**：连续失败达到 `failureCooldownThreshold` 进入指数冷却
+（`min(base·2^level, max)`），到期自动回到合格集，下次成功即清零。若**所有**账号都在冷却，
+代理 fail-open 选冷却最早到期的那个，绝不因此返回 503。可手动 `POST /admin/api/accounts/:id/reset-metrics` 清零。
+
+**成功率用内存分桶滚动窗口**（`windowSizeMs / bucketMs`），成本 O(账号数)。
+
+**记账口径（一次客户端请求只记一次终态，内部重试不重复记账）：**
+
+| 终态 | 记账 |
+|---|---|
+| 流式正常收尾 / 非流式 `200` | ok（`attempt>1` 且已交付 → ok + `retried`）|
+| 上游 `429`/`402`→`429`、零输出 `429`、空闲超时 `429` | fail |
+| 截断无 finish → `502`、传输层 `502`、上游 `5xx`/`503` | fail |
+| 上游 `400`/`404`/`422`（客户端请求错，换账号一样）| 不计 |
+| 上游 `401`/`403` | 仅记 `lastError`，按 `penalizeAuthErrors` 决定是否计入 |
+| 客户端断连 | 不计（仅释放 in-flight）|
+
+延迟信号用 TTFT（上游首字节）；总时长仅展示。
+
+**热生效 vs. 重启** —— 账号增删改、client 令牌增删改/轮换、`routing` 全字段、指标重置均**立即生效**
+（原地逐字段修改内存对象，不换引用）。`port`/`host`/`apiBase`/`adminToken`/`accountsFile`/`logFile`/`upstreamProxy`
+及既有超时 env 仍需重启。
+
+## 管理后台
+
+设置 `CC_ADMIN_TOKEN` 后打开 `http://<host>:<port>/admin`。
+
+- `/admin` 是**零机密 HTML 外壳**（加载它本身不需要令牌）；令牌由弹框输入，只存 `sessionStorage`，
+  经 `x-admin-token` 头发送。
+- `/admin/api/*` 全部鉴权（`x-admin-token` 或 `Bearer`），用定时安全比较，失败统一 `401`。
+  **未配置令牌时 `/admin*` 一律返回 404。**
+- 端点：`GET|POST /admin/api/accounts`、`PATCH|DELETE /admin/api/accounts/:id`、
+  `POST /admin/api/accounts/:id/test`（只打 `apiBase`，10s 超时，永不回显响应体/key）、
+  `POST /admin/api/accounts/:id/reset-metrics`、`GET|POST /admin/api/clients`、
+  `PATCH|DELETE /admin/api/clients/:id`、`POST /admin/api/clients/:id/rotate`、
+  `GET|PUT /admin/api/routing`、`GET /admin/api/metrics`、`GET /admin/api/config`。
+- **密钥永不出明文**：账号 key 一律 `maskKey`（前 8…后 4）；client 明文令牌**仅新建/轮换时返回一次**。
+- 四个页签：账号（脱敏 key、启停、权重滑杆、实时成功率/TTFT/在途/冷却）、客户端令牌、
+  路由配置（滑杆 + 实时评分预览）、指标（表格 + 纯 CSS 条形图）。指标每 2s 轮询。
+- 安全：CSP 带每响应 nonce、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`；
+  管理面**不**发 `Access-Control-Allow-Origin: *`；测试端点不接受 URL（无 SSRF 面）。
+
 ## Docker 部署
 
 ### 从 GHCR 拉取
@@ -562,12 +659,14 @@ npm run docker:build:multi
 
 ### 环境变量
 
-容器相关的只有两个，其余全部见上面的[环境变量](#环境变量)总表：
+容器相关的只有以下几项，其余全部见上面的[环境变量](#环境变量)总表：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
+| `CC_ADMIN_TOKEN` | 空 | 开启 `/admin` 管理后台；空则关闭 |
+| `CC_ACCOUNTS_FILE` | `/app/data/accounts.json` | 容器内账号池文件（compose 已挂载 `./data:/app/data`，重建不丢）|
 
 ## 在途请求上限（可选）
 

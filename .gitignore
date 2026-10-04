@@ -7,4 +7,6 @@ AGENTS.md
 stdout.txt
 stderr.txt
 captured-requests/
-
+accounts.json
+data/
+.trae
