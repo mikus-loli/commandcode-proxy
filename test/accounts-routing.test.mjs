@@ -179,6 +179,23 @@ test('PUT /admin/api/routing 热改权重：200 且无需重启', async () => {
   });
 });
 
+test('旧 creditCooldownMs 配置被丢弃，不保留原始值', async () => {
+  await withSetup(MAIN, async ({ proxy }) => {
+    for (const value of [3600000, 'invalid', -1, { value: 999999999 }]) {
+      const response = await admin(proxy, 'PUT', '/admin/api/routing', {
+        creditCooldownMs: value,
+      });
+      assert.equal(response.status, 200);
+      const saved = await response.json();
+      assert.equal(Object.hasOwn(saved.routing, 'creditCooldownMs'), false);
+      const got = await (await admin(proxy, 'GET', '/admin/api/routing')).json();
+      assert.equal(Object.hasOwn(got.routing, 'creditCooldownMs'), false);
+      const stored = JSON.parse(readFileSync(join(proxy.workdir, 'accounts.json'), 'utf8'));
+      assert.equal(Object.hasOwn(stored.routing, 'creditCooldownMs'), false);
+    }
+  });
+});
+
 // ── 10 & 11. legacy 直通 / 未知凭据 401 ────────────────────
 test('legacy 回归：user_xxx 原样透传，未知凭据 401 文案一致', async () => {
   await withSetup(MAIN, async ({ proxy, mock }) => {
