@@ -403,7 +403,6 @@ function selectAccount(client) {
 function reserveAccount(accountId) {
   const r = getRuntime(accountId);
   r.inFlight++;
-  r.totals.requests++;
   r.lastUsedAt = Date.now();
 }
 function releaseInflight(accountId) {
@@ -421,6 +420,8 @@ function classifyUpstreamStatus(status) {
 function releaseAccount(accountId, outcome, latencyMs) {
   const r = getRuntime(accountId);
   if (r.inFlight > 0) r.inFlight--;
+  // 请求总数与结果计数在同一处递增：保证 requests >= ok+fail+neutral 恒成立、无漂移窗口
+  r.totals.requests++;
   const now = Date.now();
   const routing = STORE.routing;
   const state = outcome && outcome.state;

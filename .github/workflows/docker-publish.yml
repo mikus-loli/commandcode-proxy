@@ -42,6 +42,10 @@ jobs:
             type=ref,event=tag
             type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v') }}
+            # workflow_dispatch 在非 release 分支上时上面几条都为空，会导致
+            # push=true 却没有 tag，buildx 报 "tag is needed when pushing to registry"。
+            # 用分支名兜底，保证手动触发始终有 tag。
+            type=ref,event=branch
 
       - name: Build and push
         uses: docker/build-push-action@v6
