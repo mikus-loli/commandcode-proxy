@@ -617,11 +617,18 @@ Set `CC_ADMIN_TOKEN` and open `http://<host>:<port>/admin`.
   `POST /admin/api/accounts/:id/test` (probes `apiBase` only, 10s timeout, never echoes the body/key),
   `POST /admin/api/accounts/:id/reset-metrics`, `GET|POST /admin/api/clients`,
   `PATCH|DELETE /admin/api/clients/:id`, `POST /admin/api/clients/:id/rotate`,
-  `GET|PUT /admin/api/routing`, `GET /admin/api/metrics`, `GET /admin/api/config`.
+  `GET|PUT /admin/api/routing`, `GET /admin/api/metrics`, `GET /admin/api/config`,
+  `GET /admin/api/usage` (all accounts, concurrency ≤ 4, results cached 5 min),
+  `GET /admin/api/accounts/:id/usage` (one account, `?refresh=1` bypasses the cache).
 - **Secrets never leave masked**: account keys are always shown as `maskKey` (`first8…last4`), and a
   client token is returned in plaintext **only once** on create/rotate.
-- Four tabs: accounts (cards with masked key, enable toggle, weight slider, live success/TTFT/in-flight/cooldown),
-  client tokens, routing config (sliders with live score preview), and metrics (tables + CSS bars). Metrics poll every 2s.
+- Five tabs: accounts (cards with masked key, enable toggle, weight slider, live success/TTFT/in-flight/cooldown),
+  client tokens, routing config (sliders with live score preview), metrics (tables + CSS bars), and
+  credits (per-account plan, subscription status, remaining/spent credits, days left). Metrics and credits poll every 2s.
+- **Credits**: read-only passthrough of CC's `/alpha/whoami`, `/alpha/billing/credits`,
+  `/alpha/billing/subscriptions` and `/alpha/usage/summary` (fixed `apiBase` paths only — no SSRF, the
+  apiKey is never echoed), normalized to plan name + monthly/purchased/free balances plus a usage ratio;
+  cached server-side for 5 min so the UI poll cannot hammer the upstream.
 - Security: CSP with per-response nonce, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
   the admin plane does **not** emit `Access-Control-Allow-Origin: *`, and the test endpoint takes no URL
   (no SSRF).

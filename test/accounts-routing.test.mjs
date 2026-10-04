@@ -277,3 +277,82 @@ test('GET /admin 200 含 <html>，无未转义模板残迹，不含账号 key', 
     assert.equal(r.headers.get('x-frame-options'), 'DENY');
   });
 });
+
+// 额度 mock：模拟 CC 官方 4 个只读额度端点
+function usageMock(opts = {}) {
+  const json = (res, o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+  return {
+    env: { CC_ADMIN_TOKEN: ADMIN_TOKEN },
+    ...opts,
+    onRequest(req, res) {
+      const u = req.url;
+      if (opts.failWhoami && u.startsWith('/alpha/whoami')) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'boom' } }));
+        return;
+      }
+      if (u.startsWith('/alpha/whoami')) {
+        return json(res, { org: { id: 'org_1', login: 'acme' }, user: { userName: 'u1' }, orgLimits: [] });
+      }
+      if (u.startsWith('/alpha/billing/credits')) {
+        return json(res, { credits: { planId: 'individual-goat', monthlyCredits: 12.5, purchasedCredits: 3, freeCredits: 0 } });
+      }
+      if (u.startsWith('/alpha/billing/subscriptions')) {
+        return json(res, { data: { planId: 'individual-goat', status: 'active', currentPeriodStart: '2026-10-01T00:00:00Z', currentPeriodEnd: '2026-11-01T00:00:00Z' } });
+      }
+      if (u.startsWith('/alpha/usage/summary')) return json(res, { totalCost: 20 });
+    },
+  };
+}
+const whoamiHits = (mock) => mock.seen.filter(s => s.url.startsWith('/alpha/whoami')).length;
+
+// ── 17. 额度归一化 + 掩码 + 缓存 ────────────────────────────
+test('额度查看：/admin/api/usage 归一化套餐/余额、不回显 key、命中缓存', async () => {
+  await withSetup(usageMock(), async ({ proxy, mock }) => {
+    const raw = 'user_quota_KEY_42';
+    const acc = await addAccount(proxy, { name: 'quota-A', apiKey: raw });
+    const r = await admin(proxy, 'GET', '/admin/api/usage');
+    assert.equal(r.status, 200);
+    const txt = await r.text();
+    assert.ok(!txt.includes(raw), 'usage response must not echo the upstream key');
+    const body = JSON.parse(txt);
+    const u = body.usage[0];
+    assert.equal(u.id, acc.id);
+    assert.equal(u.ok, true);
+    assert.equal(u.plan.name, 'GOAT');
+    assert.equal(u.credits.monthlyRemaining, 12.5);
+    assert.equal(u.credits.purchasedRemaining, 3);
+    assert.equal(u.credits.totalRemaining, 15.5);
+    assert.equal(u.whoami.orgLogin, 'acme');
+    assert.equal(u.subscription.status, 'active');
+    assert.ok(u.daysLeft > 0);
+
+    // 二次 GET 命中 5 分钟缓存：不再打上游
+    const before = whoamiHits(mock);
+    await admin(proxy, 'GET', '/admin/api/usage');
+    assert.equal(whoamiHits(mock), before, 'cached call should not hit upstream again');
+    // ?refresh=1 强制绕过缓存
+    await admin(proxy, 'GET', '/admin/api/usage?refresh=1');
+    assert.ok(whoamiHits(mock) > before, 'refresh=1 must refetch from upstream');
+  });
+});
+
+// ── 18. 单账号额度 + 上游异常降级 + 404 ────────────────────
+test('额度查看：/admin/api/accounts/:id/usage 单账号；上游异常降级为 ok:false', async () => {
+  await withSetup(usageMock({ failWhoami: true }), async ({ proxy }) => {
+    const acc = await addAccount(proxy, { name: 'quota-B', apiKey: 'user_quota_B' });
+    const one = await admin(proxy, 'GET', '/admin/api/accounts/' + acc.id + '/usage');
+    assert.equal(one.status, 200);
+    const view = (await one.json()).usage;
+    assert.equal(view.id, acc.id);
+    assert.equal(view.ok, false);
+    assert.equal(view.error, 'upstream_500');
+
+    const all = await admin(proxy, 'GET', '/admin/api/usage');
+    assert.equal(all.status, 200);
+    assert.equal((await all.json()).usage[0].ok, false);
+
+    const missing = await admin(proxy, 'GET', '/admin/api/accounts/acc_nope/usage');
+    assert.equal(missing.status, 404);
+  });
+});

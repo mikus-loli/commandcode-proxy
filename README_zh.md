@@ -607,10 +607,16 @@ CLI 发送图片的格式：
   `POST /admin/api/accounts/:id/test`（只打 `apiBase`，10s 超时，永不回显响应体/key）、
   `POST /admin/api/accounts/:id/reset-metrics`、`GET|POST /admin/api/clients`、
   `PATCH|DELETE /admin/api/clients/:id`、`POST /admin/api/clients/:id/rotate`、
-  `GET|PUT /admin/api/routing`、`GET /admin/api/metrics`、`GET /admin/api/config`。
+  `GET|PUT /admin/api/routing`、`GET /admin/api/metrics`、`GET /admin/api/config`、
+  `GET /admin/api/usage`（全部账号额度，并发上限 4、结果缓存 5 分钟）、
+  `GET /admin/api/accounts/:id/usage`（单账号额度，`?refresh=1` 绕过缓存）。
 - **密钥永不出明文**：账号 key 一律 `maskKey`（前 8…后 4）；client 明文令牌**仅新建/轮换时返回一次**。
-- 四个页签：账号（脱敏 key、启停、权重滑杆、实时成功率/TTFT/在途/冷却）、客户端令牌、
-  路由配置（滑杆 + 实时评分预览）、指标（表格 + 纯 CSS 条形图）。指标每 2s 轮询。
+- 五个页签：账号（脱敏 key、启停、权重滑杆、实时成功率/TTFT/在途/冷却）、客户端令牌、
+  路由配置（滑杆 + 实时评分预览）、指标（表格 + 纯 CSS 条形图）、
+  额度（每个账号的套餐/订阅状态/剩余与已用额度/到期天数）。指标与额度每 2s 轮询。
+- **额度**：只读转发 CC 官方 `/alpha/whoami`、`/alpha/billing/credits`、`/alpha/billing/subscriptions`、
+  `/alpha/usage/summary`（仅打 `apiBase` 固定路径，无 SSRF、不回显 apiKey），
+  归一化为套餐名 + 月度/充值/免费余额，并计算已用比例；服务端缓存 5 分钟避免前端轮询打爆上游。
 - 安全：CSP 带每响应 nonce、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`；
   管理面**不**发 `Access-Control-Allow-Origin: *`；测试端点不接受 URL（无 SSRF 面）。
 

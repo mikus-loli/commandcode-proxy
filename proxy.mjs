@@ -4322,6 +4322,134 @@ function validateAccountIds(v) {
   return { ok: true, value: v.map(String) };
 }
 
+// ── Command Code 额度 / 用量（只读上游；只打 CFG.apiBase；永不回显 key） ──
+// 端点与字段对齐官方 CLI（command-code dist/cli.mjs）：
+//   GET /alpha/whoami?limits=1                → { org:{id,login}, user:{userName}, orgLimits:[...] }
+//   GET /alpha/billing/credits?orgId=…        → { credits:{ planId, monthlyCredits, purchasedCredits, freeCredits, windowLimits, sandboxMinutes, sandboxAccess } }
+//   GET /alpha/billing/subscriptions?orgId=…  → { data:{ planId, status, currentPeriodStart, currentPeriodEnd } }
+//   GET /alpha/usage/summary?orgId=…&since=…  → { totalCost }
+const USAGE_TTL_MS = 300000;   // 同一账号额度结果缓存 5 分钟，避免前端轮询把上游打爆
+const USAGE_TIMEOUT_MS = 10000;
+const USAGE_CONCURRENCY = 4;   // 批量拉取并发上限
+const PLAN_TOTAL_CREDITS = {
+  'individual-go': 10, 'individual-go-v1': 10, 'individual-goat': 70,
+  'individual-pro': 30, 'individual-pro-v1': 80, 'individual-provider': 15,
+  'individual-max': 150, 'individual-ultra': 300, 'teams-pro': 40,
+};
+const PLAN_NAMES = {
+  'individual-go': 'Go', 'individual-go-v1': 'Go', 'individual-goat': 'GOAT',
+  'individual-pro': 'Pro', 'individual-pro-v1': 'Pro', 'individual-provider': 'Provider',
+  'individual-max': 'Max', 'individual-ultra': 'Ultra', 'teams-pro': 'Teams Pro',
+};
+const PLAN_KEYS = Object.keys(PLAN_TOTAL_CREDITS).sort((a, b) => b.length - a.length);
+const usageCache = new Map();  // accountId → { at, view }
+
+function planInfoOf(planId) {
+  if (!planId || typeof planId !== 'string') return null;
+  const norm = planId.toLowerCase().replace(/_/g, '-');
+  const key = PLAN_KEYS.find(k => norm.startsWith(k));
+  if (!key) return null;
+  return { id: planId, name: PLAN_NAMES[key] || key, monthlyCredits: PLAN_TOTAL_CREDITS[key] };
+}
+function uNum(x) { const n = Number(x); return Number.isFinite(n) ? n : 0; }
+function uDaysLeft(iso, now) {
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) ? Math.max(0, Math.ceil((t - now) / 86400000)) : null;
+}
+async function usageJSON(path, apiKey) {
+  const resp = await upstreamFetch(CFG.apiBase + path, {
+    headers: {
+      'User-Agent': 'cli',
+      'x-command-code-version': CC_VERSION,
+      'x-cli-environment': 'production',
+      'x-project-slug': CFG.projectSlug,
+      'Authorization': 'Bearer ' + apiKey,
+    },
+    signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
+  });
+  if (!resp.ok) { const e = new Error('upstream_' + resp.status); e.status = resp.status; throw e; }
+  return resp.json();
+}
+async function fetchAccountUsage(account) {
+  const whoRaw = await usageJSON('/alpha/whoami?limits=1', account.apiKey);
+  const who = whoRaw && whoRaw.data ? whoRaw.data : (whoRaw || {});
+  const org = who.org || {};
+  const q = org.id ? ('?orgId=' + encodeURIComponent(org.id)) : '';
+  const [credRaw, subRaw] = await Promise.all([
+    usageJSON('/alpha/billing/credits' + q, account.apiKey),
+    usageJSON('/alpha/billing/subscriptions' + q, account.apiKey),
+  ]);
+  const creds = (credRaw && (credRaw.credits || (credRaw.data && credRaw.data.credits))) || {};
+  const sub = (subRaw && (subRaw.data || subRaw)) || {};
+  let summary = null;
+  if (sub.currentPeriodStart) {
+    try {
+      const sRaw = await usageJSON(
+        '/alpha/usage/summary' + q + (q ? '&' : '?') + 'since=' + encodeURIComponent(sub.currentPeriodStart),
+        account.apiKey,
+      );
+      summary = sRaw && sRaw.data ? sRaw.data : sRaw;
+    } catch { /* summary 缺失不影响其余额度展示 */ }
+  }
+  const now = Date.now();
+  const plan = planInfoOf(creds.planId || sub.planId);
+  const monthlyRemaining = Math.max(0, uNum(creds.monthlyCredits));
+  const purchasedRemaining = Math.max(0, uNum(creds.purchasedCredits));
+  const freeRemaining = Math.max(0, uNum(creds.freeCredits));
+  const totalRemaining = monthlyRemaining + purchasedRemaining + freeRemaining;
+  const totalSpent = Math.max(0, uNum(summary && summary.totalCost));
+  const poolBase = (sub.status === 'active' && plan)
+    ? Math.max(plan.monthlyCredits, monthlyRemaining)
+    : totalSpent + totalRemaining;
+  const totalPool = poolBase + purchasedRemaining + freeRemaining;
+  return {
+    ok: true,
+    fetchedAt: new Date(now).toISOString(),
+    whoami: { orgId: org.id || null, orgLogin: org.login || null, userName: (who.user && who.user.userName) || null },
+    plan,
+    subscription: { status: sub.status || null, currentPeriodStart: sub.currentPeriodStart || null, currentPeriodEnd: sub.currentPeriodEnd || null },
+    daysLeft: sub.currentPeriodEnd ? uDaysLeft(sub.currentPeriodEnd, now) : null,
+    credits: {
+      monthlyRemaining, purchasedRemaining, freeRemaining,
+      totalRemaining, totalSpent, totalPool,
+      usagePercent: totalPool > 0 ? Math.min(1, Math.max(0, (totalPool - totalRemaining) / totalPool)) : 0,
+      hasCreditsInfo: totalRemaining > 0 || totalSpent > 0,
+      windowLimits: creds.windowLimits || null,
+      sandboxMinutes: creds.sandboxMinutes !== undefined ? creds.sandboxMinutes : null,
+      sandboxAccess: creds.sandboxAccess === true,
+    },
+    orgLimits: who.orgLimits || [],
+  };
+}
+async function getAccountUsage(account, force) {
+  const cached = usageCache.get(account.id);
+  if (!force && cached && Date.now() - cached.at < USAGE_TTL_MS) return cached.view;
+  let view;
+  try {
+    const data = await fetchAccountUsage(account);
+    view = { id: account.id, name: account.name, enabled: account.enabled, ...data };
+  } catch (e) {
+    const status = e && e.status;
+    view = {
+      id: account.id, name: account.name, enabled: account.enabled, ok: false,
+      error: e && e.name === 'TimeoutError' ? 'timeout' : (status ? 'upstream_' + status : 'network_error'),
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+  usageCache.set(account.id, { at: Date.now(), view });
+  return view;
+}
+async function allAccountsUsage(force) {
+  const items = STORE.accounts.slice();
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(USAGE_CONCURRENCY, items.length) }, async () => {
+    while (i < items.length) { const idx = i++; out[idx] = await getAccountUsage(items[idx], force); }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 // 零机密 HTML 外壳：不需要令牌（令牌由前端弹框输入，仅存 sessionStorage）
 // 转义纪律：内嵌 JS 一律单引号拼接，禁止反引号与 ${；DOM 一律 textContent/createElement，严禁 innerHTML。
 function sendAdminShell(req, res) {
@@ -4411,6 +4539,7 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
     <button class="tab" data-tab="clients">客户端令牌</button>
     <button class="tab" data-tab="routing">路由配置</button>
     <button class="tab" data-tab="metrics">指标</button>
+    <button class="tab" data-tab="usage">额度</button>
   </nav>
   <main id="view"></main>
 </div>
@@ -4420,7 +4549,7 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 'use strict';
 var TKEY='ccp_admin_token';
 var token=sessionStorage.getItem(TKEY)||'';
-var S={tab:'accounts',accounts:[],clients:[],routing:null,metrics:null,config:null};
+var S={tab:'accounts',accounts:[],clients:[],routing:null,metrics:null,config:null,usage:null,usageLoading:false};
 
 function byId(x){return document.getElementById(x);}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined&&text!==null)e.textContent=String(text);return e;}
@@ -4533,6 +4662,7 @@ function renderView(){
   if(S.tab==='accounts')renderAccounts(v);
   else if(S.tab==='clients')renderClients(v);
   else if(S.tab==='routing')renderRouting(v);
+  else if(S.tab==='usage')renderUsage(v);
   else renderMetrics(v);
 }
 function metricOf(id){var a=S.metrics&&S.metrics.accounts;if(!a)return null;for(var i=0;i<a.length;i++)if(a[i].id===id)return a[i];return null;}
@@ -4869,6 +4999,70 @@ function renderMetrics(root){
   append(tbl,tb);root.appendChild(tbl);
 }
 
+function usageMoney(v){return (v===null||v===undefined||!isFinite(v))?'—':('$'+Number(v).toFixed(2));}
+function usageBar(percent){
+  var bar=el('div','bar');var fill=el('i');var p=percent||0;
+  fill.style.width=(Math.round(p*100)+'%');
+  if(p>=0.9)fill.style.background='#f85149';
+  else if(p>=0.7)fill.style.background='#d29922';
+  append(bar,fill);return bar;
+}
+function loadUsage(force){
+  if(S.usageLoading)return Promise.resolve();
+  S.usageLoading=true;
+  return api('/admin/api/usage'+(force?'?refresh=1':'')).then(function(j){
+    S.usage=j.usage||[];S.usageLoading=false;
+    if(S.tab==='usage')renderView();
+    if(force)toast('额度已刷新','ok');
+  }).catch(function(e){
+    S.usageLoading=false;
+    if(e&&e.auth){showAuth();return;}
+    toast('额度加载失败：'+(e&&e.message?e.message:String(e)),'err');
+  });
+}
+function renderUsage(root){
+  var head=el('div','section-head');
+  append(head,el('h2',null,'Command Code 额度'));
+  append(head,mkbtn('刷新','',function(){loadUsage(true);}));
+  root.appendChild(head);
+  append(root,el('p','muted','直接读取上游 /alpha/whoami 与 /alpha/billing/*，每账号缓存 5 分钟；账号 key 全程不外泄。'));
+  if(!S.usage){
+    append(root,el('p','muted','加载中…'));
+    if(!S.usageLoading)loadUsage(false);
+    return;
+  }
+  if(S.usage.length===0){append(root,el('p','muted','还没有账号。'));return;}
+  var tbl=el('table');var thead=el('thead');var tr=el('tr');
+  ['账号','套餐','状态','剩余','已用','总额','用量','到期','更新时间'].forEach(function(x){append(tr,el('th',null,x));});
+  append(thead,tr);append(tbl,thead);
+  var tb=el('tbody');
+  S.usage.forEach(function(u){
+    var r=el('tr');
+    append(r,el('td',null,u.name||u.id));
+    if(!u.ok){
+      var td=el('td');td.colSpan=8;td.className='muted';
+      td.textContent='读取失败：'+(u.error||'unknown');
+      append(r,td);append(tb,r);return;
+    }
+    append(r,el('td',null,u.plan?u.plan.name:'—'));
+    append(r,el('td',null,(u.subscription&&u.subscription.status)?u.subscription.status:'—'));
+    var c=u.credits||{};
+    var tdRem=el('td');
+    append(tdRem,el('b',null,usageMoney(c.totalRemaining)),
+      el('div','muted','月 '+usageMoney(c.monthlyRemaining)+' · 充值 '+usageMoney(c.purchasedRemaining)+' · 免费 '+usageMoney(c.freeRemaining)));
+    append(r,tdRem);
+    append(r,el('td',null,usageMoney(c.totalSpent)));
+    append(r,el('td',null,usageMoney(c.totalPool)));
+    var tdPct=el('td');
+    append(tdPct,usageBar(c.usagePercent),document.createTextNode(' '+pct(c.usagePercent)));
+    append(r,tdPct);
+    append(r,el('td',null,(typeof u.daysLeft==='number')?(u.daysLeft+' 天'):'—'));
+    append(r,el('td',null,fmtTime(u.fetchedAt)));
+    append(tb,r);
+  });
+  append(tbl,tb);root.appendChild(tbl);
+}
+
 function boot(){
   byId('logout').onclick=logout;
   var tabs=byId('tabs').children;
@@ -4984,12 +5178,14 @@ async function handleAdmin(req, res, url) {
           merged.updatedAt = new Date().toISOString();
           const next = normalizeAccount(merged);
           STORE.accounts[idx] = next;
+          usageCache.delete(next.id);   // key/名称变化后额度需重取
           persistAccounts();
           return adminJSON(res, 200, { account: accountView(next), ...persistWarning() });
         }
         if (method === 'DELETE') {
           const removed = STORE.accounts.splice(idx, 1)[0];
           runtime.delete(removed.id);
+          usageCache.delete(removed.id);
           // 同步从所有 client 白名单剔除，避免指向已删账号
           for (const c of STORE.clients) {
             if (Array.isArray(c.accountIds)) c.accountIds = c.accountIds.filter(x => x !== removed.id);
@@ -5033,6 +5229,12 @@ async function handleAdmin(req, res, url) {
       if (segs.length === 3 && segs[2] === 'reset-metrics' && method === 'POST') {
         resetRuntime(STORE.accounts[idx].id);
         return adminJSON(res, 200, { ok: true, id: STORE.accounts[idx].id });
+      }
+
+      if (segs.length === 3 && segs[2] === 'usage' && method === 'GET') {
+        // 只读上游额度；?refresh=1 强制绕过 5 分钟缓存
+        const view = await getAccountUsage(STORE.accounts[idx], url.searchParams.get('refresh') === '1');
+        return adminJSON(res, 200, { usage: view });
       }
       return fail(404, 'Not found', 'not_found');
     }
@@ -5128,6 +5330,13 @@ async function handleAdmin(req, res, url) {
         return adminJSON(res, 200, { routing: next, ...persistWarning() });
       }
       return fail(405, 'Method not allowed', 'method_not_allowed');
+    }
+
+    // ── /admin/api/usage ────────────────────────────────
+    if (segs[0] === 'usage' && segs.length === 1 && method === 'GET') {
+      const force = url.searchParams.get('refresh') === '1';
+      const usage = await allAccountsUsage(force);
+      return adminJSON(res, 200, { usage, ttlMs: USAGE_TTL_MS, fetchedAt: new Date().toISOString() });
     }
 
     // ── /admin/api/metrics ──────────────────────────────
