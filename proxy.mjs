@@ -1107,6 +1107,27 @@ function getDateStr() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
+// 把客户端（Hermes / OpenAI 风格）的 reasoning_effort 归一化成 CC 能接受的档位。
+// CC 的 params.reasoning_effort 只认 off|low|medium|high|xhigh|max，其它值会被
+// 上游 400 拒绝：
+//   Invalid request error. Often missing required parameters or typo.
+//   HINT: Validation error: Invalid option: expected one of
+//     "off"|"low"|"medium"|"high"|"xhigh"|"max" at "params.reasoning_effort"
+// Hermes 会发 OpenAI 风格的 none/minimal 与自家档位 ultra，直接透传即 400，
+// 所以在此统一映射；无法识别的值一律不发该字段，宁可用上游默认也不制造 400。
+const REASONING_EFFORT_PASSTHROUGH = new Set(['off', 'low', 'medium', 'high', 'xhigh', 'max']);
+function normalizeReasoningEffort(value) {
+  // 非字符串（null / 数字 / 对象 …）无法识别，直接丢弃。
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim().toLowerCase();
+  if (!key) return undefined;                 // 空串 / 纯空白
+  if (REASONING_EFFORT_PASSTHROUGH.has(key)) return key;  // 合法档位，忽略大小写与空白后原样下发
+  if (key === 'none' || key === 'disabled' || key === 'false') return 'off';  // 语义等价：关闭思考
+  if (key === 'minimal') return 'low';        // CC 没有比 low 更弱的"开启"档；绝不能折成 off（那会静默关闭思考）
+  if (key === 'ultra') return 'max';          // Hermes 内部档位，CC 顶格是 max
+  return undefined;                           // 其余未知值：省略字段，避免 400
+}
+
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
@@ -1267,8 +1288,10 @@ function buildCcRequest(openaiReq) {
   if (temperature !== undefined) {
     body.params.temperature = temperature;
   }
-  if (reasoning_effort !== undefined) {
-    body.params.reasoning_effort = reasoning_effort;
+  // 出口归一化：这是 /v1/chat/completions 与 /v1/messages 共用的唯一出口
+  const normalizedEffort = normalizeReasoningEffort(reasoning_effort);
+  if (normalizedEffort !== undefined) {
+    body.params.reasoning_effort = normalizedEffort;
   }
   // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
   // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
