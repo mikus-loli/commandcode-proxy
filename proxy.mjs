@@ -85,6 +85,9 @@ function defaultRouting() {
     weights: { successRate: 0.5, latency: 0.3, load: 0.2, quota: 0.2 },
     quotaFloor: 0.2,
     quotaUnknownScore: 1,
+    expiringBoostEnabled: false,
+    expiringWindowDays: 7,
+    expiringBoost: 100,
     windowSizeMs: 300000,                   // 成功率滚动窗口 5min
     bucketMs: 30000,                        // 窗口分桶粒度（内存 O(1)）
     priorAlpha: 5,                          // Beta 先验强度（冷启动）
@@ -176,6 +179,9 @@ function normalizeRouting(raw) {
   r.loadReference = clampNum(raw.loadReference, d.loadReference, 0.1, 10000);
   r.quotaFloor = clampNum(raw.quotaFloor, d.quotaFloor, 0, 1);
   r.quotaUnknownScore = clampNum(raw.quotaUnknownScore, d.quotaUnknownScore, 0, 1);
+  r.expiringBoostEnabled = raw.expiringBoostEnabled === true;
+  r.expiringWindowDays = clampNum(raw.expiringWindowDays, d.expiringWindowDays, 1, 90);
+  r.expiringBoost = clampNum(raw.expiringBoost, d.expiringBoost, 1, 10000);
   r.cooldownBaseMs = clampNum(raw.cooldownBaseMs, d.cooldownBaseMs, 1000, 3600000);
   r.cooldownMaxMs = clampNum(raw.cooldownMaxMs, d.cooldownMaxMs, r.cooldownBaseMs, 86400000);
   r.failureCooldownThreshold = clampNum(raw.failureCooldownThreshold, d.failureCooldownThreshold, 1, 1000);
@@ -290,6 +296,7 @@ function newRuntime() {
     inFlight: 0,
     usagePercent: null,
     usageAt: 0,
+    periodEndAt: null,
     totals: { requests: 0, ok: 0, fail: 0, neutral: 0, retried: 0 },
     buckets: [],
     consecutiveFailures: 0,
@@ -324,6 +331,7 @@ function resetRuntime(id) {
   next.usageAt = old.usageAt;
   next.creditExhausted = old.creditExhausted;
   next.creditResetAt = old.creditResetAt;
+  next.periodEndAt = old.periodEndAt;
   next.windowExhausted = old.windowExhausted;
   next.windowResetAt = old.windowResetAt;
   next.windowKind = old.windowKind;
@@ -435,11 +443,18 @@ function scoreAccount(account, r, now, routing, maxWeight) {
   const wQ = wsum > 0 ? routing.weights.quota / wsum : 1 / 4;
   const base = wS * S + wL * L + wC * C + wQ * Q;
   const weightFactor = maxWeight > 0 ? account.weight / maxWeight : 1;
-  const score = r.creditExhausted || r.windowExhausted || r.cooldownUntil > now ? 0 : base * weightFactor;
+  const blocked = r.creditExhausted || r.windowExhausted || r.cooldownUntil > now;
+  const expiring = !blocked && routing.expiringBoostEnabled === true
+    && Number.isFinite(r.periodEndAt) && r.periodEndAt > now
+    && (r.periodEndAt - now) <= routing.expiringWindowDays * 86400000
+    && remaining !== null && remaining > 0;
+  const boost = expiring ? routing.expiringBoost : 1;
+  const score = blocked ? 0 : base * weightFactor * boost;
   return {
     score,
     components: {
       success: S, latency: L, load: C, quota: Q, usagePercent: r.usagePercent, remaining, weightFactor, base,
+      expiringBoostApplied: expiring, periodEndAt: r.periodEndAt,
       samples: st.n, ok: st.ok, fail: st.fail,
       cooldownUntil: r.cooldownUntil, ewmaTtftMs: r.ewmaTtftMs, inFlight: r.inFlight,
     },
@@ -5072,6 +5087,9 @@ async function getAccountUsage(account, force) {
       view = { id: account.id, name: account.name, enabled: account.enabled, ...data };
       const rt = getRuntime(account.id);
       if (Number.isFinite(view.credits.usagePercent)) rt.usagePercent = view.credits.usagePercent;
+      const pe = view.subscription && view.subscription.currentPeriodEnd;
+      const peMs = pe ? Date.parse(pe) : NaN;
+      if (Number.isFinite(peMs) && peMs > 0) rt.periodEndAt = peMs;
       rt.usageAt = Date.now();
       expireWindowBlock(rt, Date.now());
       updateWindowBlock(rt, view.credits.windowLimits, Date.now());
@@ -5647,6 +5665,7 @@ function accountCard(a,m){
   if(m&&m.components){
     var components=m.components;
     append(rows,el('div','muted score-components','评分构成：S '+Number(components.success).toFixed(2)+' · L '+Number(components.latency).toFixed(2)+' · C '+Number(components.load).toFixed(2)+' · Q '+Number(components.quota).toFixed(2)+' · 权重因子 '+Number(components.weightFactor).toFixed(2)+' · 基分 '+Number(components.base).toFixed(2)+(m.cooling||m.windowExhausted||m.creditExhausted?' · 评分归零（受阻）':'')));
+    if(components.expiringBoostApplied)append(rows,statusBadge('快重置 ×'+S.routing.expiringBoost,'yellow'));
   }
   addRow(rows,'冷却',(m&&m.cooling)?(m.creditResetUnknown?'套餐重置时间未知':('剩余 '+fmtDur(m.cooldownUntil-Date.now()))):'否');
   if(m&&m.creditExhausted)addRow(rows,'额度',m.creditResetAt?'耗尽（到套餐重置时间恢复：'+new Date(m.creditResetAt).toLocaleString()+'）':'耗尽（套餐重置时间未知，保持停用）');
@@ -5847,6 +5866,13 @@ function renderRouting(root){
   var pQu=fieldInput('额度未知分 quotaUnknownScore',R.quotaUnknownScore!==undefined?R.quotaUnknownScore:1,'number');
   [pQf.inp,pQu.inp].forEach(function(x){x.min=0;x.max=1;x.step=0.01;});
   [pRef.el,pCf.el,pCu.el,pQw.el,pQf.el,pQu.el].forEach(function(x){quotaGrid.appendChild(x);});append(quotaGroup,quotaGrid);append(card,quotaGroup);
+  var expiringGroup=el('div','route-group');append(expiringGroup,el('div','route-group-title','快重置优先'));var expiringGrid=el('div','grid');
+  var pExpiring=el('label','switch');var expiringEnabled=el('input');expiringEnabled.type='checkbox';expiringEnabled.checked=R.expiringBoostEnabled===true;append(pExpiring,expiringEnabled,el('span',null,'启用快重置优先 expiringBoostEnabled'));
+  var pExpiringDays=fieldInput('快重置界限（天） expiringWindowDays',R.expiringWindowDays!==undefined?R.expiringWindowDays:7,'number');
+  pExpiringDays.inp.min=1;pExpiringDays.inp.max=90;pExpiringDays.inp.step='any';
+  var pExpiringBoost=fieldInput('快重置倍数 expiringBoost',R.expiringBoost!==undefined?R.expiringBoost:100,'number');
+  pExpiringBoost.inp.min=1;pExpiringBoost.inp.max=10000;pExpiringBoost.inp.step='any';
+  [pExpiring,pExpiringDays.el,pExpiringBoost.el].forEach(function(x){expiringGrid.appendChild(x);});append(expiringGroup,expiringGrid);append(card,expiringGroup);
   append(card,el('h3',null,'策略预览（按当前滑杆值实时计算）'));
   var prevBox=el('div');append(card,prevBox);
   var err=el('div','err');append(card,err);
@@ -5869,6 +5895,9 @@ function renderRouting(root){
       creditUsageThreshold:Number(pCu.inp.value),
       quotaFloor:Number(pQf.inp.value),
       quotaUnknownScore:Number(pQu.inp.value),
+      expiringBoostEnabled:expiringEnabled.checked,
+      expiringWindowDays:Number(pExpiringDays.inp.value),
+      expiringBoost:Number(pExpiringBoost.inp.value),
       weights:{successRate:Number(sS.inp.value)/100,latency:Number(sL.inp.value)/100,load:Number(sC.inp.value)/100,quota:Number(pQw.inp.value)/100}
     };
     api('/admin/api/routing',{method:'PUT',body:body}).then(function(){toast('路由配置已更新','ok');refresh(true);})
