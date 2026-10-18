@@ -581,7 +581,9 @@ CLI 发送图片的格式：
     "enabled": true, "accountIds": null, "notes": "",
     "createdAt": "…", "updatedAt": "…", "lastUsedAt": null }],
   "routing": { "strategy": "weighted", "selection": "weighted_random",
-    "weights": { "successRate": 0.5, "latency": 0.3, "load": 0.2 },
+    "weights": { "successRate": 0.5, "latency": 0.3, "load": 0.2, "quota": 0.2 },
+    "quotaFloor": 0.2, "quotaUnknownScore": 1,
+    "expiringBoostEnabled": false, "expiringWindowDays": 7, "expiringBoost": 100,
     "windowSizeMs": 300000, "bucketMs": 30000,
     "priorAlpha": 5, "priorSuccessRate": 0.8,
     "latencyEwmaAlpha": 0.3, "latencyFloorMs": 400, "latencyCeilMs": 60000,
@@ -595,17 +597,31 @@ CLI 发送图片的格式：
 `accountIds: null` 表示「允许全部账号」；数组则是显式白名单。
 
 **评分** —— 合格账号依次经过 `enabled` → client 白名单 → `maxInflight` 饱和硬排除 → 冷却软排除。
-三个归一化分量（越大越好，`∈[0,1]`）：
+四个归一化分量（越大越好，`∈[0,1]`）：
 
 - **成功率**（Beta 先验解决冷启动）：`S = (ok + priorAlpha·priorSuccessRate) / (n + priorAlpha)`
 - **延迟**：`L = clamp((ceil − ewmaTtftMs) / (ceil − floor), 0, 1)`；无样本时用 `unknownLatencyScore`
 - **负载**：`maxInflight > 0 ? 1 − inFlight/maxInflight : 1/(1 + inFlight/loadReference)`
+- **额度**：`remaining = 1 − usagePercent`；`remaining ≥ quotaFloor` 时 `Q = 1`，
+  低于则 `Q = remaining / quotaFloor`（线性下滑，用完为 0）；额度未知时用 `quotaUnknownScore`
 
-合成：权重内部归一化 → `base = wS·S + wL·L + wC·C`；账号权重作乘子
+合成：权重内部归一化 → `base = wS·S + wL·L + wC·C + wQ·Q`；账号权重作乘子
 `weightFactor = weight / maxWeightInEligible`；`score = base × weightFactor`（冷却中为 `0`）。
 并列打破（确定性）：score → inFlight 少 → ewmaTtft 小 → LRU → id 字典序。
 
 默认 `weighted_random` 轮盘赌（`weight` 即流量份额）；`selection: "best"` 则严格 argmax（测试/排障用）。
+
+**快重置优先（`expiringBoostEnabled`）** —— 订阅额度不累积、用不完作废，所以可以让
+**计费周期即将结束**的账号优先吃掉剩余额度。开启后，满足以下**全部条件**的账号在评分上乘以
+`expiringBoost`（默认 `100`，即几乎独占）：
+
+- 账号未被阻断（额度枯竭 / 窗口超限 / 冷却中任一都不算，阻断始终优先，**boost 不能把阻断账号救回来**）
+- 已取到 `currentPeriodEnd`（来自上游 `/alpha/billing/subscriptions`），且**晚于当前时刻**
+- 距该时刻不超过 `expiringWindowDays` 天（默认 `7`）
+- 剩余额度 `> 0`（用完的不参与）
+
+判定用的是**月度计费周期结束时间**，与 5 小时 / 每周限流窗口无关。默认关闭。
+面板「路由配置」页可开关并调整天数与倍数。
 
 **失败降级与恢复**：连续失败达到 `failureCooldownThreshold` 进入指数冷却
 （`min(base·2^level, max)`），到期自动回到合格集，下次成功清零普通失败冷却。
