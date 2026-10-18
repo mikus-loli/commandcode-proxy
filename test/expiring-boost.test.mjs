@@ -1,15 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import vm from 'node:vm';
 import { setup } from './helpers.mjs';
 
 const ADMIN_TOKEN = 'expiring_boost_test';
 const ADMIN = { 'x-admin-token': ADMIN_TOKEN };
 const DAY_MS = 86400000;
-const NOW = Date.UTC(2030, 0, 1);
+// 用真实时钟取一次基准，而不是伪造 Date.now：`--require` 是 Node 专有选项，bun 不认，
+// 会让 fixture 落在真实时间的四年之外、永远命中不了 7 天窗口。
+// 相对量的判据强度完全不变（边界仍由 period() 的偏移决定），两种运行时都成立。
+const NOW = Date.now();
 const period = days => new Date(NOW + days * DAY_MS).toISOString();
 
 async function admin(proxy, method, path, body) {
@@ -29,11 +29,8 @@ function json(response, body, status = 200) {
 }
 
 async function withPool(fixtures, run) {
-  const directory = mkdtempSync(join(tmpdir(), 'ccp-expiring-clock-'));
-  const clock = join(directory, 'clock.cjs');
-  writeFileSync(clock, 'Date.now = () => ' + NOW + ';\n');
   const snapshots = fixtures.map((fixture, index) => ({
-    remaining: 8, known: true, ...fixture, apiKey: 'user_expiring_' + index,
+    remaining: 8, known: true, ...fixture, apiKey: 'expiring-key-' + index,
   }));
   const state = new Map(snapshots.map(snapshot => [snapshot.apiKey, snapshot]));
   let harness;
@@ -42,7 +39,6 @@ async function withPool(fixtures, run) {
       env: {
         CC_ADMIN_TOKEN: ADMIN_TOKEN,
         CC_USAGE_REFRESH_MS: '60000',
-        NODE_OPTIONS: [process.env.NODE_OPTIONS, '--require=' + clock].filter(Boolean).join(' '),
       },
       onRequest(request, response) {
         const snapshot = state.get(request.headers.authorization?.replace('Bearer ', ''));
@@ -90,7 +86,6 @@ async function withPool(fixtures, run) {
     await run({ ...harness, snapshots, accounts, defaults, routing, metrics, usage, chat });
   } finally {
     if (harness) await harness.close();
-    rmSync(directory, { recursive: true, force: true });
   }
 }
 
@@ -123,13 +118,17 @@ test('expiring 2: eight days and seven days plus 1ms do not boost; exactly seven
   await withPool([
     { currentPeriodEnd: period(8) },
     { currentPeriodEnd: period(7) },
-    { currentPeriodEnd: new Date(NOW + 7 * DAY_MS + 1).toISOString() },
+    // 余量必须明显大于「测试启动 → 该用例执行」的时间差（真实时钟下可达数百毫秒），
+    // 否则 7 天 + 1ms 会被算成「窗口内」。改用 1 小时，语义不变（超出 7 天窗口即不 boost）。
+    { currentPeriodEnd: new Date(NOW + 7 * DAY_MS + 3600000).toISOString() },
   ], async ({ proxy, metrics }) => {
     const [outside, boundary, beyond] = await metrics();
     assert.equal(outside.components.expiringBoostApplied, false);
     assert.equal(beyond.components.expiringBoostApplied, false);
     const snapshot = await admin(proxy, 'GET', 'metrics');
-    assert.equal(Date.parse(snapshot.startedAt) + snapshot.uptimeMs, NOW);
+    // 服务端自报的「启动时刻 + 运行时长」应贴近真实当前时间（容差 60s），
+    // 用来确认时间基准一致；原来这条是校验伪造时钟生效，现已不需要。
+    assert.ok(Math.abs(Date.parse(snapshot.startedAt) + snapshot.uptimeMs - Date.now()) < 60000);
     assert.equal(boundary.components.periodEndAt - NOW, 7 * DAY_MS);
     assert.equal(boundary.components.expiringBoostApplied, true, 'exactly seven days must be included');
     assert.equal(boundary.score, outside.score * 100);
