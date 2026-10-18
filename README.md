@@ -587,7 +587,9 @@ client --(ccp_ token)--> handler
     "enabled": true, "accountIds": null, "notes": "",
     "createdAt": "…", "updatedAt": "…", "lastUsedAt": null }],
   "routing": { "strategy": "weighted", "selection": "weighted_random",
-    "weights": { "successRate": 0.5, "latency": 0.3, "load": 0.2 },
+    "weights": { "successRate": 0.5, "latency": 0.3, "load": 0.2, "quota": 0.2 },
+    "quotaFloor": 0.2, "quotaUnknownScore": 1,
+    "expiringBoostEnabled": false, "expiringWindowDays": 7, "expiringBoost": 100,
     "windowSizeMs": 300000, "bucketMs": 30000,
     "priorAlpha": 5, "priorSuccessRate": 0.8,
     "latencyEwmaAlpha": 0.3, "latencyFloorMs": 400, "latencyCeilMs": 60000,
@@ -601,18 +603,33 @@ client --(ccp_ token)--> handler
 `accountIds: null` means "all accounts allowed"; an array is an explicit whitelist.
 
 **Scoring** — eligible accounts are filtered by `enabled` → client whitelist → `maxInflight`
-saturation → cooldown (soft). Three normalised components (higher is better, `∈[0,1]`):
+saturation → cooldown (soft). Four normalised components (higher is better, `∈[0,1]`):
 
 - **Success rate** (Beta prior avoids cold-start bias): `S = (ok + priorAlpha·priorSuccessRate) / (n + priorAlpha)`
 - **Latency**: `L = clamp((ceil − ewmaTtftMs) / (ceil − floor), 0, 1)`; `unknownLatencyScore` when no samples
 - **Load**: `maxInflight > 0 ? 1 − inFlight/maxInflight : 1/(1 + inFlight/loadReference)`
+- **Quota**: `remaining = 1 − usagePercent`; `Q = 1` when `remaining ≥ quotaFloor`, otherwise
+  `Q = remaining / quotaFloor` (linear decay, `0` when exhausted); `quotaUnknownScore` when unknown
 
-Composition: weights are normalised internally → `base = wS·S + wL·L + wC·C`; the account weight
+Composition: weights are normalised internally → `base = wS·S + wL·L + wC·C + wQ·Q`; the account weight
 is a multiplier `weightFactor = weight / maxWeightInEligible`; `score = base × weightFactor`
 (cooldown → `0`). Ties break deterministically: score → fewer in-flight → smaller EWMA → LRU → id.
 
 Selection is `weighted_random` (roulette — `weight` is effectively a traffic share) by default;
 `selection: "best"` forces strict argmax (useful for testing/troubleshooting).
+
+**Expiring-credit priority (`expiringBoostEnabled`)** — subscription credits do not roll over, so
+quota about to expire is better spent than wasted. When enabled, accounts meeting **all** of these
+get their score multiplied by `expiringBoost` (default `100`, i.e. near-exclusive):
+
+- not blocked (credit-exhausted / window-exceeded / cooling — blocked always wins, and
+  **the boost can never revive a blocked account**)
+- `currentPeriodEnd` known (from upstream `/alpha/billing/subscriptions`) and still in the future
+- within `expiringWindowDays` days from now (default `7`)
+- remaining credits `> 0` (exhausted accounts never participate)
+
+It keys off the **monthly billing period end**, independent of the 5-hour / weekly rate-limit windows.
+Off by default; toggle and tune it on the panel's Routing tab.
 
 **Degradation & recovery**: `failureCooldownThreshold` consecutive failures put an account into
 exponential cooldown (`min(base·2^level, max)`); it returns to the eligible set when cooldown

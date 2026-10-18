@@ -1,6 +1,12 @@
 node_modules/
 .git/
 *.log
+# 凭据与运行时数据：当前 Dockerfile 只 COPY 指定文件，但显式挡住以免将来改成 `COPY . .`
+# 时把账号 key / 管理 token 打进镜像层（镜像层删不掉，一旦推出去就是永久泄漏）。
+data/
+accounts.json
+.env
+.env.*
 .commandcode/
 .opencode/
 .omo/
